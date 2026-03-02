@@ -481,10 +481,11 @@ fn find_cut_point(
 
     for i in (start_index..end_index).rev() {
         let entry = &entries[i];
-        let SessionEntry::Message(msg_entry) = entry else {
+        if let Some(msg) = message_from_entry(entry) {
+            accumulated_tokens = accumulated_tokens.saturating_add(estimate_tokens(&msg));
+        } else {
             continue;
-        };
-        accumulated_tokens = accumulated_tokens.saturating_add(estimate_tokens(&msg_entry.message));
+        }
 
         if accumulated_tokens >= u64::from(keep_recent_tokens) {
             // Binary search: find the largest cut point <= i.

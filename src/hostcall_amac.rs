@@ -288,8 +288,7 @@ impl AmacStallTelemetry {
         let sum: u64 = self
             .recent_samples
             .iter()
-            .map(|sample| sample.elapsed_ns)
-            .sum();
+            .fold(0u64, |acc, sample| acc.saturating_add(sample.elapsed_ns));
         let mean = sum / n;
         let variance: u64 = self
             .recent_samples
@@ -298,7 +297,7 @@ impl AmacStallTelemetry {
                 let diff = sample.elapsed_ns.abs_diff(mean);
                 diff.saturating_mul(diff)
             })
-            .sum::<u64>()
+            .fold(0u64, |acc, val| acc.saturating_add(val))
             / n;
         variance
     }

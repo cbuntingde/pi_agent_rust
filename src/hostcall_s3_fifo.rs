@@ -421,17 +421,26 @@ impl<K: Ord + Clone> S3FifoPolicy<K> {
     }
 
     fn increment_owner(&mut self, owner: &str) {
-        let entry = self.owner_live_counts.entry(owner.to_string()).or_insert(0);
-        *entry = entry.saturating_add(1);
+        if let Some(count) = self.owner_live_counts.get_mut(owner) {
+            *count = count.saturating_add(1);
+        } else {
+            self.owner_live_counts.insert(owner.to_string(), 1);
+        }
     }
 
     fn decrement_owner(&mut self, owner: &str) {
-        let Some(count) = self.owner_live_counts.get_mut(owner) else {
-            return;
-        };
-        if *count > 1 {
-            *count -= 1;
+        let should_remove = if let Some(count) = self.owner_live_counts.get_mut(owner) {
+            if *count > 1 {
+                *count -= 1;
+                false
+            } else {
+                true
+            }
         } else {
+            false
+        };
+        
+        if should_remove {
             self.owner_live_counts.remove(owner);
         }
     }

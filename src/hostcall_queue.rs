@@ -453,11 +453,11 @@ impl S3FifoState {
             return;
         }
         if let Some(tenant_key) = tenant_key {
-            let entry = self
-                .tenant_backlog
-                .entry(tenant_key.to_string())
-                .or_insert(0);
-            *entry = entry.saturating_add(1);
+            if let Some(backlog) = self.tenant_backlog.get_mut(tenant_key) {
+                *backlog = backlog.saturating_add(1);
+            } else {
+                self.tenant_backlog.insert(tenant_key.to_string(), 1);
+            }
         }
         self.unstable_rejection_streak = 0;
     }
