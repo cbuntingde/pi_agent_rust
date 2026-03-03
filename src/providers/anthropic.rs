@@ -329,12 +329,18 @@ impl AnthropicProvider {
             }
         }
 
+        let temperature = if thinking.is_some() {
+            Some(1.0)
+        } else {
+            options.temperature
+        };
+
         AnthropicRequest {
             model: &self.model,
             messages,
             system: context.system_prompt.as_deref(),
             max_tokens,
-            temperature: options.temperature,
+            temperature,
             tools,
             stream: true,
             thinking,
@@ -1226,7 +1232,7 @@ mod tests {
         let request = provider.build_request(&context, &options);
         assert_eq!(request.model, "claude-test");
         assert_eq!(request.system, Some("System prompt"));
-        assert_eq!(request.temperature, Some(0.2));
+        assert_eq!(request.temperature, Some(1.0)); // thinking forces temperature to 1.0
         assert!(request.stream);
         assert_eq!(request.max_tokens, 13_096);
 
