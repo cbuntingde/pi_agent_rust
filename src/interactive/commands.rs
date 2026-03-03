@@ -1718,6 +1718,14 @@ After approving access in the browser, press Enter in Pi to complete login.",
 
         match oauth_result {
             Ok((info, ext_config)) => {
+                // Start a local callback server for localhost redirect URIs
+                // so the browser redirect is captured automatically (issue #22).
+                let callback_server = info
+                    .redirect_uri
+                    .as_deref()
+                    .filter(|uri| crate::auth::redirect_uri_needs_callback_server(uri))
+                    .and_then(|uri| crate::auth::start_oauth_callback_server(uri).ok());
+
                 let mut message = format!(
                     "OAuth login: {}\n\nOpen this URL:\n{}\n",
                     info.provider, info.url
@@ -1729,14 +1737,37 @@ Using consumer OAuth tokens outside the official client may violate Anthropic's 
 result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_API_KEY) instead.\n",
                     );
                 }
-                if let Some(instructions) = info.instructions {
+                if callback_server.is_some() {
+                    message.push_str(
+                        "\nListening for callback — complete authorization in your browser.\n\
+                         Pi will continue automatically, or you can paste the code manually.",
+                    );
+                } else if let Some(instructions) = info.instructions {
                     message.push('\n');
                     message.push_str(&instructions);
                     message.push('\n');
+                    message.push_str(
+                        "\nPaste the callback URL or authorization code into Pi to continue.",
+                    );
+                } else {
+                    message.push_str(
+                        "\nPaste the callback URL or authorization code into Pi to continue.",
+                    );
                 }
-                message.push_str(
-                    "\nPaste the callback URL or authorization code into Pi to continue.",
-                );
+
+                // Spawn a thread to wait for the callback and inject the code
+                // via the event channel when the browser redirect arrives.
+                if let Some(server) = callback_server {
+                    let event_tx = self.event_tx.clone();
+                    std::thread::spawn(move || {
+                        // Block until the callback arrives or the sender is dropped.
+                        if let Ok(path) = server.rx.recv() {
+                            let full_url = format!("http://localhost{path}");
+                            let _ =
+                                event_tx.try_send(PiMsg::OAuthCallbackReceived(full_url));
+                        }
+                    });
+                }
 
                 self.messages.push(ConversationMessage {
                     role: MessageRole::System,

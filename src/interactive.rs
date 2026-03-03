@@ -1217,6 +1217,9 @@ pub enum PiMsg {
         display: String,
         is_error: bool,
     },
+    /// OAuth callback server received the browser redirect.
+    /// The string is the full callback URL (e.g. `http://localhost:1455/auth/callback?code=abc&state=xyz`).
+    OAuthCallbackReceived(String),
 }
 
 /// Read the current git branch from `.git/HEAD` in the given directory.

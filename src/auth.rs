@@ -1503,6 +1503,134 @@ pub struct OAuthStartInfo {
     pub url: String,
     pub verifier: String,
     pub instructions: Option<String>,
+    /// The redirect URI used in the authorization request.
+    /// When this points to localhost, a local callback server should be started.
+    pub redirect_uri: Option<String>,
+}
+
+// ── Local OAuth callback server ─────────────────────────────────
+
+/// Handle for a background TCP listener that receives the OAuth redirect callback.
+///
+/// When the OAuth provider redirects the browser to a `localhost` URI, this
+/// server accepts a single connection, extracts the full request URL (which
+/// contains the `code` and `state` query parameters), sends a success HTML
+/// page to the browser, and delivers the URL through the returned receiver.
+pub struct OAuthCallbackServer {
+    /// Receives the full request path+query (e.g. `/auth/callback?code=abc&state=xyz`).
+    pub rx: std::sync::mpsc::Receiver<String>,
+    /// The port the server is listening on (for logging/diagnostics).
+    pub port: u16,
+    _handle: std::thread::JoinHandle<()>,
+}
+
+/// Start a local TCP listener on the port specified in `redirect_uri`.
+///
+/// The server accepts exactly one connection, responds with a friendly HTML page
+/// so the browser shows "You can close this tab", and sends the full callback URL
+/// through the returned `OAuthCallbackServer.rx`.
+///
+/// Returns `Err` if the redirect URI does not contain a parseable port or the
+/// port cannot be bound.
+pub fn start_oauth_callback_server(redirect_uri: &str) -> Result<OAuthCallbackServer> {
+    // Parse the port from the redirect URI (e.g. "http://localhost:1455/auth/callback").
+    let port = parse_port_from_uri(redirect_uri).ok_or_else(|| {
+        Error::auth(format!(
+            "Cannot parse port from OAuth redirect URI: {redirect_uri}"
+        ))
+    })?;
+
+    let listener = std::net::TcpListener::bind(format!("127.0.0.1:{port}")).map_err(|e| {
+        Error::auth(format!(
+            "Failed to bind OAuth callback server on port {port}: {e}"
+        ))
+    })?;
+
+    // Set a generous timeout so the thread doesn't hang forever if the user
+    // cancels. The thread will exit when the listener is dropped or when a
+    // connection arrives.
+    listener
+        .set_nonblocking(false)
+        .map_err(|e| Error::auth(format!("Failed to configure callback listener: {e}")))?;
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+
+    let handle = std::thread::spawn(move || {
+        // Accept exactly one connection.
+        let Ok((mut stream, _addr)) = listener.accept() else {
+            return;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+
+        // Read the HTTP request (we only need the first line: `GET /path?query HTTP/1.1`).
+        let mut buf = [0u8; 4096];
+        let n = match stream.read(&mut buf) {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+
+        let request = String::from_utf8_lossy(&buf[..n]);
+        let request_path = request
+            .lines()
+            .next()
+            .and_then(|line| {
+                // "GET /auth/callback?code=abc&state=xyz HTTP/1.1"
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    Some(parts[1].to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        // Send a friendly response so the browser shows a success page.
+        let html = r#"<!DOCTYPE html>
+<html><head><title>Pi Agent — OAuth Complete</title></head>
+<body style="font-family:system-ui,sans-serif;text-align:center;padding:60px 20px;background:#f8f9fa">
+<h1 style="color:#2d7d46">&#10003; Authorization successful</h1>
+<p>You can close this browser tab and return to Pi Agent.</p>
+</body></html>"#;
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+            html.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+
+        // Deliver the callback URL to the waiting caller.
+        let _ = tx.send(request_path);
+    });
+
+    Ok(OAuthCallbackServer {
+        rx,
+        port,
+        _handle: handle,
+    })
+}
+
+/// Extract the port number from a localhost redirect URI.
+///
+/// Supports formats like `http://localhost:1455/auth/callback` and
+/// `http://127.0.0.1:8085/oauth2callback`.
+fn parse_port_from_uri(uri: &str) -> Option<u16> {
+    // Strip scheme
+    let without_scheme = uri
+        .strip_prefix("http://")
+        .or_else(|| uri.strip_prefix("https://"))?;
+    // Take host:port part (before the path)
+    let host_port = without_scheme.split('/').next()?;
+    // Extract port after the last colon
+    let port_str = host_port.rsplit(':').next()?;
+    port_str.parse::<u16>().ok()
+}
+
+/// Returns `true` if this redirect URI points to localhost (and therefore
+/// needs a local callback server).
+pub fn redirect_uri_needs_callback_server(redirect_uri: &str) -> bool {
+    let lower = redirect_uri.to_lowercase();
+    lower.starts_with("http://localhost:") || lower.starts_with("http://127.0.0.1:")
 }
 
 // ── Device Flow (RFC 8628) ──────────────────────────────────────
@@ -1858,6 +1986,7 @@ pub fn start_anthropic_oauth() -> Result<OAuthStartInfo> {
             "Open the URL, complete login, then paste the callback URL or authorization code."
                 .to_string(),
         ),
+        redirect_uri: Some(ANTHROPIC_OAUTH_REDIRECT_URI.to_string()),
     })
 }
 
@@ -1983,6 +2112,7 @@ pub fn start_openai_codex_oauth() -> Result<OAuthStartInfo> {
             "Open the URL, complete login, then paste the callback URL or authorization code."
                 .to_string(),
         ),
+        redirect_uri: Some(OPENAI_CODEX_OAUTH_REDIRECT_URI.to_string()),
     })
 }
 
@@ -2069,6 +2199,7 @@ pub fn start_google_gemini_cli_oauth() -> Result<OAuthStartInfo> {
             "Open the URL, complete login, then paste the callback URL or authorization code."
                 .to_string(),
         ),
+        redirect_uri: Some(GOOGLE_GEMINI_CLI_OAUTH_REDIRECT_URI.to_string()),
     })
 }
 
@@ -2098,6 +2229,7 @@ pub fn start_google_antigravity_oauth() -> Result<OAuthStartInfo> {
             "Open the URL, complete login, then paste the callback URL or authorization code."
                 .to_string(),
         ),
+        redirect_uri: Some(GOOGLE_ANTIGRAVITY_OAUTH_REDIRECT_URI.to_string()),
     })
 }
 
@@ -2626,6 +2758,7 @@ pub fn start_extension_oauth(
             "Open the URL, complete login, then paste the callback URL or authorization code."
                 .to_string(),
         ),
+        redirect_uri: config.redirect_uri.clone(),
     })
 }
 
@@ -2827,6 +2960,7 @@ pub fn start_copilot_browser_oauth(config: &CopilotOAuthConfig) -> Result<OAuthS
              then paste the callback URL or authorization code."
                 .to_string(),
         ),
+        redirect_uri: None,
     })
 }
 
@@ -3126,6 +3260,7 @@ pub fn start_gitlab_oauth(config: &GitLabOAuthConfig) -> Result<OAuthStartInfo> 
             "Open the URL to authorize GitLab access on {base}, \
              then paste the callback URL or authorization code."
         )),
+        redirect_uri: config.redirect_uri.clone(),
     })
 }
 

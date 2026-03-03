@@ -3428,16 +3428,83 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 );
             }
 
-            console.print_markup(&format!(
-                "[bold]OAuth login:[/] {}\n\nOpen this URL:\n{}\n\n{}\n",
-                start.provider,
-                start.url,
-                start.instructions.as_deref().unwrap_or_default()
-            ));
-            let Some(code_input) = prompt_line("Paste callback URL or code: ")? else {
-                console.render_warning("Setup cancelled (no input).");
-                return Ok(false);
+            // Start a local callback server for localhost redirect URIs so
+            // the browser redirect is captured automatically (issue #22).
+            let callback_server = start
+                .redirect_uri
+                .as_deref()
+                .filter(|uri| pi::auth::redirect_uri_needs_callback_server(uri))
+                .and_then(|uri| match pi::auth::start_oauth_callback_server(uri) {
+                    Ok(server) => {
+                        tracing::info!(port = server.port, "OAuth callback server listening");
+                        Some(server)
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to start OAuth callback server: {e}");
+                        None
+                    }
+                });
+
+            let has_callback = callback_server.is_some();
+            if has_callback {
+                console.print_markup(&format!(
+                    "[bold]OAuth login:[/] {}\n\n\
+                     Open this URL:\n{}\n\n\
+                     Listening for callback on port {}...\n\
+                     Complete authorization in your browser — Pi will continue automatically.\n\
+                     (Or paste the callback URL / authorization code manually.)\n",
+                    start.provider,
+                    start.url,
+                    callback_server.as_ref().unwrap().port,
+                ));
+            } else {
+                console.print_markup(&format!(
+                    "[bold]OAuth login:[/] {}\n\nOpen this URL:\n{}\n\n{}\n",
+                    start.provider,
+                    start.url,
+                    start.instructions.as_deref().unwrap_or_default()
+                ));
+            }
+
+            // Race between the callback server (browser redirect) and manual paste.
+            let code_input = if let Some(server) = callback_server {
+                // Use a background thread to wait for the callback so we can
+                // also accept manual paste from stdin.
+                let (manual_tx, manual_rx) = std::sync::mpsc::channel::<String>();
+                let prompt_thread = std::thread::spawn(move || {
+                    if let Ok(Some(line)) = prompt_line("Paste callback URL or code (or wait for browser): ") {
+                        let _ = manual_tx.send(line);
+                    }
+                });
+
+                // Wait for whichever source delivers first.
+                let code = loop {
+                    // Check callback server (non-blocking).
+                    if let Ok(path) = server.rx.try_recv() {
+                        // Convert "/auth/callback?code=abc&state=xyz" to a full
+                        // URL that parse_oauth_code_input can handle.
+                        let full_url = format!("http://localhost{path}");
+                        break full_url;
+                    }
+                    // Check manual input (non-blocking).
+                    if let Ok(line) = manual_rx.try_recv() {
+                        break line;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                };
+
+                // Don't wait for the prompt thread — it will exit on its own
+                // or when stdin closes.
+                drop(prompt_thread);
+                code
+            } else {
+                let Some(line) = prompt_line("Paste callback URL or code: ")? else {
+                    console.render_warning("Setup cancelled (no input).");
+                    return Ok(false);
+                };
+                line
             };
+
             let code_input = code_input.trim();
             if code_input.is_empty() {
                 console.render_warning("No authorization code provided. Setup cancelled.");

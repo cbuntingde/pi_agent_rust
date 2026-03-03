@@ -584,6 +584,19 @@ impl PiApp {
                     return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
                 }
             }
+            PiMsg::OAuthCallbackReceived(callback_url) => {
+                // Auto-submit the OAuth code received from the local callback server.
+                if let Some(pending) = self.pending_oauth.take() {
+                    self.messages.push(ConversationMessage {
+                        role: MessageRole::System,
+                        content: "Authorization callback received from browser.".to_string(),
+                        thinking: None,
+                        collapsed: false,
+                    });
+                    self.scroll_to_bottom();
+                    return self.submit_oauth_code(&callback_url, pending);
+                }
+            }
         }
         None
     }
