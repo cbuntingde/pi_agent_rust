@@ -836,7 +836,7 @@ fn measure_event_latencies(manager: &ExtensionManager, iterations: usize) -> Vec
 
     for _ in 0..iterations {
         let start = Instant::now();
-        let _ = common::run_async({
+        common::run_async({
             let manager = manager.clone();
             async move {
                 manager
@@ -846,6 +846,7 @@ fn measure_event_latencies(manager: &ExtensionManager, iterations: usize) -> Vec
                         NORMAL_TIMEOUT_MS,
                     )
                     .await
+                    .expect("dispatch_event_with_response failed");
             }
         });
         samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
