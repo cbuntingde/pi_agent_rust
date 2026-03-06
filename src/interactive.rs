@@ -21,6 +21,7 @@ use bubbles::textarea::TextArea;
 use bubbles::viewport::Viewport;
 use bubbletea::{
     Cmd, KeyMsg, KeyType, Message, Model as BubbleteaModel, Program, WindowSizeMsg, batch, quit,
+    sequence,
 };
 use chrono::Utc;
 use crossterm::{cursor, terminal};
@@ -1409,6 +1410,11 @@ impl PiApp {
         })
     }
 
+    fn startup_init_cmd(input_cmd: Option<Cmd>, pending_cmd: Option<Cmd>) -> Option<Cmd> {
+        let startup_cmd = sequence(vec![Some(Self::initial_window_size_cmd()), pending_cmd]);
+        batch(vec![input_cmd, startup_cmd])
+    }
+
     /// Create a new Pi application.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_lines)]
@@ -1752,10 +1758,8 @@ impl PiApp {
         } else {
             Some(Cmd::new(|| Message::new(PiMsg::RunPending)))
         };
-        let size_cmd = Some(Self::initial_window_size_cmd());
-
-        // Batch commands
-        batch(vec![input_cmd, pending_cmd, size_cmd])
+        // Ensure the initial window-size refresh lands before any queued startup work.
+        Self::startup_init_cmd(input_cmd, pending_cmd)
     }
 
     fn spinner_init_cmd(&self) -> Option<Cmd> {

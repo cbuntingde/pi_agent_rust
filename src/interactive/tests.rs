@@ -79,6 +79,40 @@ fn initial_window_size_cmd_emits_window_size_message() {
 }
 
 #[test]
+fn startup_init_cmd_sequences_window_size_before_pending() {
+    let msg = PiApp::startup_init_cmd(None, Some(Cmd::new(|| Message::new(PiMsg::RunPending))))
+        .expect("startup init command")
+        .execute()
+        .expect("startup init message");
+    let sequence = msg
+        .downcast::<bubbletea::SequenceMsg>()
+        .expect("startup sequence message");
+
+    let mut cmds = sequence.0.into_iter();
+    let first = cmds
+        .next()
+        .expect("window size cmd")
+        .execute()
+        .expect("window size message");
+    assert!(
+        first.downcast_ref::<WindowSizeMsg>().is_some(),
+        "first startup command should refresh window size"
+    );
+
+    let second = cmds
+        .next()
+        .expect("pending cmd")
+        .execute()
+        .expect("pending message");
+    assert!(
+        second
+            .downcast_ref::<PiMsg>()
+            .is_some_and(|msg| matches!(msg, PiMsg::RunPending)),
+        "second startup command should run pending work"
+    );
+}
+
+#[test]
 fn tool_message_auto_collapse_threshold() {
     // Small output: not collapsed.
     let small = ConversationMessage::tool("Tool bash:\nline1\nline2".to_string());
