@@ -167,17 +167,85 @@ version_timeout_cmd() {
   printf '%s\n' ""
 }
 
-capture_version_line() {
-  local bin_path="$1"
+run_command_with_timeout_capture() {
+  local timeout_seconds="$1"
+  shift
+
   local timeout_cmd=""
   timeout_cmd="$(version_timeout_cmd)"
 
-  local out=""
   if [ -n "$timeout_cmd" ]; then
-    out=$("$timeout_cmd" 2 "$bin_path" --version 2>/dev/null | head -1 || true)
-  else
-    out=$("$bin_path" --version 2>/dev/null | head -1 || true)
+    if "$timeout_cmd" "$timeout_seconds" "$@"; then
+      return 0
+    else
+      local timeout_rc=$?
+      # Broken timeout wrappers may return 127; fall back to internal timeout handling.
+      if [ "$timeout_rc" -ne 127 ]; then
+        return "$timeout_rc"
+      fi
+    fi
   fi
+
+  local out_file=""
+  out_file="$(mktemp 2>/dev/null || true)"
+  if [ -z "$out_file" ]; then
+    return 125
+  fi
+
+  local timed_out_file=""
+  timed_out_file="$(mktemp 2>/dev/null || true)"
+  if [ -z "$timed_out_file" ]; then
+    rm -f "$out_file" 2>/dev/null || true
+    return 125
+  fi
+  : > "$timed_out_file"
+
+  "$@" > "$out_file" 2>/dev/null &
+  local cmd_pid=$!
+
+  (
+    sleep "$timeout_seconds"
+    if kill -0 "$cmd_pid" 2>/dev/null; then
+      printf '1\n' > "$timed_out_file"
+      kill "$cmd_pid" >/dev/null 2>&1 || true
+      sleep 1
+      kill -9 "$cmd_pid" >/dev/null 2>&1 || true
+    fi
+  ) &
+  local watchdog_pid=$!
+
+  local cmd_rc=0
+  if wait "$cmd_pid" 2>/dev/null; then
+    cmd_rc=0
+  else
+    cmd_rc=$?
+  fi
+
+  kill "$watchdog_pid" >/dev/null 2>&1 || true
+  wait "$watchdog_pid" 2>/dev/null || true
+
+  local timed_out=0
+  if [ -s "$timed_out_file" ]; then
+    timed_out=1
+  fi
+
+  if [ -f "$out_file" ]; then
+    cat "$out_file"
+    rm -f "$out_file" 2>/dev/null || true
+  fi
+  rm -f "$timed_out_file" 2>/dev/null || true
+
+  if [ "$timed_out" -eq 1 ]; then
+    return 124
+  fi
+  return "$cmd_rc"
+}
+
+capture_version_line() {
+  local bin_path="$1"
+  local out=""
+  out="$(run_command_with_timeout_capture 2 "$bin_path" --version || true)"
+  out="$(printf '%s\n' "$out" | head -1)"
   printf '%s\n' "$out"
 }
 
@@ -1852,24 +1920,19 @@ install_completions_for_shell() {
   fi
 
   local subcommand=""
-  local timeout_cmd=""
   local probe_timeout="${PI_INSTALLER_COMPLETION_PROBE_TIMEOUT:-3}"
   local generation_timeout="${PI_INSTALLER_COMPLETION_CMD_TIMEOUT:-10}"
-  timeout_cmd="$(version_timeout_cmd)"
 
   # Prefer static command discovery from top-level --help (safe, fast path).
   # If that fails, fall back to legacy subcommand probes guarded by a timeout.
   local root_help=""
   local root_help_ok=0
+  local root_help_rc=0
   local should_probe_subcommands=0
-  if [ -n "$timeout_cmd" ]; then
-    if root_help=$("$timeout_cmd" "$probe_timeout" "$bin" --help 2>/dev/null); then
-      root_help_ok=1
-    fi
+  if root_help="$(run_command_with_timeout_capture "$probe_timeout" "$bin" --help)"; then
+    root_help_ok=1
   else
-    if root_help=$("$bin" --help 2>/dev/null); then
-      root_help_ok=1
-    fi
+    root_help_rc=$?
   fi
 
   if [ "$root_help_ok" -eq 1 ]; then
@@ -1890,43 +1953,35 @@ install_completions_for_shell() {
 
   if [ "$should_probe_subcommands" -eq 1 ]; then
     # Help probe was unavailable or inconclusive: guard runtime probes with timeout.
-    if [ -z "$timeout_cmd" ]; then
-      if [ "$root_help_ok" -eq 0 ]; then
-        COMPLETIONS_STATUS="skipped (completion probe unavailable)"
-        info "Shell completions: skipped (unable to safely probe completion support)"
-      fi
-      # If --help was inconclusive and no timeout tool exists, fail open and skip.
-      # We intentionally avoid unbounded runtime probes in this branch.
-      subcommand=""
+    local probe_rc=0
+    local probe_timed_out=0
+    if run_command_with_timeout_capture "$probe_timeout" "$bin" completions --help >/dev/null 2>&1; then
+      subcommand="completions"
     else
-      local probe_rc=0
-      local probe_timed_out=0
-      if "$timeout_cmd" "$probe_timeout" "$bin" completions --help >/dev/null 2>&1; then
-        subcommand="completions"
+      probe_rc=$?
+      if [ "$probe_rc" -eq 124 ] || [ "$probe_rc" -eq 137 ]; then
+        probe_timed_out=1
+      fi
+      if run_command_with_timeout_capture "$probe_timeout" "$bin" completion --help >/dev/null 2>&1; then
+        subcommand="completion"
       else
         probe_rc=$?
         if [ "$probe_rc" -eq 124 ] || [ "$probe_rc" -eq 137 ]; then
           probe_timed_out=1
         fi
-        if "$timeout_cmd" "$probe_timeout" "$bin" completion --help >/dev/null 2>&1; then
-          subcommand="completion"
-        else
-          probe_rc=$?
-          if [ "$probe_rc" -eq 124 ] || [ "$probe_rc" -eq 137 ]; then
-            probe_timed_out=1
-          fi
-        fi
       fi
+    fi
 
-      if [ -z "$subcommand" ] && [ "$probe_timed_out" -eq 1 ]; then
-        COMPLETIONS_STATUS="failed (completion probe timed out)"
-        warn "Shell completions probe timed out; skipping completion installation"
-        return 1
-      fi
+    if [ -z "$subcommand" ] && [ "$probe_timed_out" -eq 1 ]; then
+      COMPLETIONS_STATUS="failed (completion probe timed out)"
+      warn "Shell completions probe timed out; skipping completion installation"
+      return 1
     fi
   fi
 
-  if [ -z "$subcommand" ] && [ "$root_help_ok" -eq 0 ] && [ -z "$timeout_cmd" ]; then
+  if [ -z "$subcommand" ] && [ "$root_help_ok" -eq 0 ] && [ "$root_help_rc" -eq 125 ]; then
+    COMPLETIONS_STATUS="skipped (completion probe unavailable)"
+    info "Shell completions: skipped (unable to safely probe completion support)"
     return 0
   fi
 
@@ -1960,20 +2015,14 @@ install_completions_for_shell() {
   fi
 
   local completion_output
-  if [ -n "$timeout_cmd" ]; then
-    local completion_rc=0
-    completion_output=$("$timeout_cmd" "$generation_timeout" "$bin" "$subcommand" "$shell_name" 2>/dev/null) || completion_rc=$?
-    if [ "$completion_rc" -ne 0 ]; then
-      if [ "$completion_rc" -eq 124 ] || [ "$completion_rc" -eq 137 ]; then
-        COMPLETIONS_STATUS="failed (completion generation timed out)"
-        warn "Failed to generate $shell_name completions (timed out)"
-        return 1
-      fi
-      COMPLETIONS_STATUS="failed (completion generation error)"
-      warn "Failed to generate $shell_name completions"
+  local completion_rc=0
+  completion_output="$(run_command_with_timeout_capture "$generation_timeout" "$bin" "$subcommand" "$shell_name")" || completion_rc=$?
+  if [ "$completion_rc" -ne 0 ]; then
+    if [ "$completion_rc" -eq 124 ] || [ "$completion_rc" -eq 137 ]; then
+      COMPLETIONS_STATUS="failed (completion generation timed out)"
+      warn "Failed to generate $shell_name completions (timed out)"
       return 1
     fi
-  elif ! completion_output=$("$bin" "$subcommand" "$shell_name" 2>/dev/null); then
     COMPLETIONS_STATUS="failed (completion generation error)"
     warn "Failed to generate $shell_name completions"
     return 1

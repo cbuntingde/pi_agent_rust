@@ -113,6 +113,23 @@ EOF
   chmod +x "${dir}/fakebin/uname"
 }
 
+write_timeout_unusable_stubs() {
+  local dir="$1"
+  cat > "${dir}/fakebin/timeout" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+exit 127
+STUB
+  chmod +x "${dir}/fakebin/timeout"
+
+  cat > "${dir}/fakebin/gtimeout" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+exit 127
+STUB
+  chmod +x "${dir}/fakebin/gtimeout"
+}
+
 write_curl_artifact_stub() {
   local dir="$1"
   cat > "${dir}/fakebin/curl" <<'STUB'
@@ -1481,6 +1498,32 @@ test_completions_help_conclusive_no_command_skips_fast() {
   assert_output_contains "$dir" "Shell:     skipped (unsupported by this pi build)"
 }
 
+test_completions_internal_timeout_fallback_succeeds() {
+  local dir artifact artifact_url checksum completion_file
+  dir="$(case_dir "completions-internal-timeout-fallback")"
+  write_existing_pi_stub "$dir"
+  write_timeout_unusable_stubs "$dir"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_artifact_binary "$artifact" "help_lists_completions"
+  artifact_url="file://${artifact}"
+  checksum="$(sha256_file "$artifact")"
+
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "${artifact_url}" \
+    --checksum "${checksum}" \
+    --completions bash
+
+  completion_file="${dir}/data/bash-completion/completions/pi"
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Installed bash completions to"
+  assert_output_contains "$dir" "Shell:     installed (bash)"
+  [ -f "$completion_file" ] || { echo "expected completion file: ${completion_file}" >&2; return 1; }
+}
+
 test_completions_probe_timeout_is_non_fatal() {
   local dir artifact artifact_url checksum
   dir="$(case_dir "completions-probe-timeout")"
@@ -1573,6 +1616,7 @@ main() {
   run_test test_completions_help_discovery_path_succeeds
   run_test test_completions_help_inconclusive_falls_back_to_probe
   run_test test_completions_help_conclusive_no_command_skips_fast
+  run_test test_completions_internal_timeout_fallback_succeeds
   run_test test_completions_probe_timeout_is_non_fatal
   run_test test_completions_generation_timeout_is_non_fatal
 
