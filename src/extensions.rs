@@ -18976,6 +18976,42 @@ fn is_likely_auxiliary_extension_entry(path: &Path) -> bool {
     .any(|needle| preview.contains(needle))
 }
 
+fn is_likely_flat_extension_entry(path: &Path) -> bool {
+    let Ok(raw) = fs::read(path) else {
+        return false;
+    };
+    let preview_len = raw.len().min(32_768);
+    let preview = String::from_utf8_lossy(&raw[..preview_len]);
+
+    let has_default_initializer = [
+        "export default function",
+        "export default async function",
+        "export default(",
+        "export default (",
+        "export default async(",
+        "export default async (",
+    ]
+    .iter()
+    .any(|needle| preview.contains(needle));
+
+    let has_registration = [
+        "registerCommand(",
+        "registerTool(",
+        "registerProvider(",
+        "registerShortcut(",
+        "registerFlag(",
+        "pi.registerCommand(",
+        "pi.registerTool(",
+        "pi.registerProvider(",
+        "pi.registerShortcut(",
+        "pi.registerFlag(",
+    ]
+    .iter()
+    .any(|needle| preview.contains(needle));
+
+    has_default_initializer || has_registration
+}
+
 fn discover_auxiliary_example_entries(
     package_dir: &Path,
     canonical_primary: &Path,
@@ -19316,6 +19352,9 @@ fn discover_sibling_extension_entries(primary: &Path) -> Vec<PathBuf> {
     sibling_dirs.sort();
 
     for path in sibling_files {
+        if !is_likely_flat_extension_entry(&path) {
+            continue;
+        }
         let canonical = safe_canonicalize(&path);
         if seen.insert(canonical.clone()) {
             out.push(canonical);
@@ -28875,13 +28914,30 @@ mod tests {
 
         let a = root.join("a.ts");
         let b = root.join("b.ts");
-        std::fs::write(&a, "export default {};\n").expect("write a");
-        std::fs::write(&b, "export default {};\n").expect("write b");
+        std::fs::write(&a, "export default function initA(_pi) {}\n").expect("write a");
+        std::fs::write(&b, "export default function initB(_pi) {}\n").expect("write b");
 
         let discovered = discover_related_extension_entries(&a);
         assert_eq!(discovered.len(), 2);
         assert!(discovered.contains(&safe_canonicalize(&a)));
         assert!(discovered.contains(&safe_canonicalize(&b)));
+    }
+
+    #[test]
+    fn discover_related_extension_entries_ignores_flat_helper_siblings() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("doom-like");
+        std::fs::create_dir_all(&root).expect("mkdir doom-like");
+
+        let index = root.join("index.ts");
+        let helper = root.join("engine.ts");
+        let util = root.join("wad-finder.ts");
+        std::fs::write(&index, "export default function init(_pi) {}\n").expect("write index");
+        std::fs::write(&helper, "export class DoomEngine {}\n").expect("write helper");
+        std::fs::write(&util, "export function ensureWadFile() {}\n").expect("write util");
+
+        let discovered = discover_related_extension_entries(&index);
+        assert_eq!(discovered, vec![safe_canonicalize(&index)]);
     }
 
     #[test]
