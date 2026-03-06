@@ -7,13 +7,15 @@
 //! Architecture:
 //! - Native Rust functions (`__pi_wasm_*`) handle compile/instantiate/call
 //! - A JS polyfill wraps them into the standard `WebAssembly` namespace
-//! - Memory is synced as ArrayBuffer snapshots (wasmtime → JS) via a getter
+//! - Optional staged virtual files and a small host import surface support
+//!   Emscripten-style modules such as the DOOM overlay fixture
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Instant;
 
+use anyhow::anyhow;
 use rquickjs::function::Func;
 use rquickjs::{ArrayBuffer, Ctx, Value};
 use serde::Serialize;
@@ -31,12 +33,26 @@ use wasmtime::{
 struct WasmHostData {
     /// Maximum memory pages allowed (enforced on grow).
     max_memory_pages: u64,
+    /// Files staged from JS for modules that expect a host filesystem.
+    staged_files: HashMap<String, Vec<u8>>,
+    /// Open virtual file descriptors for staged files.
+    open_files: HashMap<u32, VirtualFileHandle>,
+    /// Next synthetic file descriptor.
+    next_fd: u32,
+    /// Monotonic start time for `emscripten_get_now`.
+    started_at: Instant,
 }
 
 /// Per-instance state: the wasmtime `Store` owns all WASM objects.
 struct InstanceState {
     store: Store<WasmHostData>,
     instance: WasmInstance,
+}
+
+#[derive(Clone)]
+struct VirtualFileHandle {
+    path: String,
+    position: usize,
 }
 
 #[derive(Serialize)]
@@ -50,6 +66,7 @@ pub(crate) struct WasmBridgeState {
     engine: Engine,
     modules: HashMap<u32, WasmModule>,
     instances: HashMap<u32, InstanceState>,
+    staged_files: HashMap<String, Vec<u8>>,
     next_id: u32,
     max_modules: usize,
     max_instances: usize,
@@ -62,6 +79,7 @@ impl WasmBridgeState {
             engine,
             modules: HashMap::new(),
             instances: HashMap::new(),
+            staged_files: HashMap::new(),
             next_id: 1,
             max_modules: DEFAULT_MAX_MODULES,
             max_instances: DEFAULT_MAX_INSTANCES,
@@ -126,6 +144,12 @@ fn extract_bytes(ctx: &Ctx<'_>, value: &Value<'_>) -> rquickjs::Result<Vec<u8>> 
                 .as_bytes()
                 .map(<[u8]>::to_vec)
                 .ok_or_else(|| throw_wasm(ctx, "TypeError", "Detached ArrayBuffer"));
+        }
+        if let Some(typed) = obj.as_typed_array::<u8>() {
+            return typed
+                .as_bytes()
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| throw_wasm(ctx, "TypeError", "Detached TypedArray"));
         }
     }
     // Try array of numbers
@@ -242,12 +266,152 @@ fn validate_call_result_types(ctx: &Ctx<'_>, result_types: &[ValType]) -> rquick
 }
 
 // ---------------------------------------------------------------------------
-// Import stubs
+// Import helpers
 // ---------------------------------------------------------------------------
 
-/// Register no-op stub functions for every function import the module requires.
-/// Non-function imports are currently skipped (MVP behavior).
-fn register_stub_imports(
+fn instance_memory(inst: &mut InstanceState, mem_name: &str) -> Result<wasmtime::Memory, String> {
+    inst.instance
+        .get_memory(&mut inst.store, mem_name)
+        .ok_or_else(|| format!("Memory '{mem_name}' not found"))
+}
+
+fn caller_memory(caller: &mut Caller<'_, WasmHostData>) -> Result<wasmtime::Memory, String> {
+    caller
+        .get_export("memory")
+        .and_then(wasmtime::Extern::into_memory)
+        .ok_or_else(|| "Exported memory 'memory' not found".to_string())
+}
+
+fn checked_memory_range(
+    offset: usize,
+    len: usize,
+    memory_len: usize,
+) -> Result<std::ops::Range<usize>, String> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| "Memory access overflow".to_string())?;
+    if end > memory_len {
+        return Err("Memory access out of bounds".to_string());
+    }
+    Ok(offset..end)
+}
+
+fn caller_read_bytes(
+    caller: &mut Caller<'_, WasmHostData>,
+    offset: usize,
+    len: usize,
+) -> Result<Vec<u8>, String> {
+    let memory = caller_memory(caller)?;
+    let _ = checked_memory_range(offset, len, memory.data_size(&mut *caller))?;
+    let mut bytes = vec![0_u8; len];
+    memory
+        .read(&mut *caller, offset, &mut bytes)
+        .map_err(|err| err.to_string())?;
+    Ok(bytes)
+}
+
+fn caller_write_bytes(
+    caller: &mut Caller<'_, WasmHostData>,
+    offset: usize,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let memory = caller_memory(caller)?;
+    let _ = checked_memory_range(offset, bytes.len(), memory.data_size(&mut *caller))?;
+    memory
+        .write(&mut *caller, offset, bytes)
+        .map_err(|err| err.to_string())
+}
+
+fn caller_read_u32(caller: &mut Caller<'_, WasmHostData>, offset: usize) -> Result<u32, String> {
+    let bytes = caller_read_bytes(caller, offset, 4)?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn caller_write_u32(
+    caller: &mut Caller<'_, WasmHostData>,
+    offset: usize,
+    value: u32,
+) -> Result<(), String> {
+    caller_write_bytes(caller, offset, &value.to_le_bytes())
+}
+
+fn caller_write_u64(
+    caller: &mut Caller<'_, WasmHostData>,
+    offset: usize,
+    value: u64,
+) -> Result<(), String> {
+    caller_write_bytes(caller, offset, &value.to_le_bytes())
+}
+
+fn caller_read_c_string(
+    caller: &mut Caller<'_, WasmHostData>,
+    offset: usize,
+) -> Result<String, String> {
+    let memory = caller_memory(caller)?;
+    let bytes = memory.data(&mut *caller);
+    let mut end = offset;
+    while end < bytes.len() && bytes[end] != 0 {
+        end += 1;
+    }
+    if end >= bytes.len() {
+        return Err("Unterminated string in WASM memory".to_string());
+    }
+    Ok(String::from_utf8_lossy(&bytes[offset..end]).into_owned())
+}
+
+fn val_i32(params: &[Val], idx: usize, label: &str) -> Result<i32, String> {
+    match params.get(idx) {
+        Some(Val::I32(value)) => Ok(*value),
+        _ => Err(format!("Expected i32 parameter '{label}' at index {idx}")),
+    }
+}
+
+fn val_i64(params: &[Val], idx: usize, label: &str) -> Result<i64, String> {
+    match params.get(idx) {
+        Some(Val::I64(value)) => Ok(*value),
+        Some(Val::I32(value)) => Ok(i64::from(*value)),
+        _ => Err(format!("Expected i64 parameter '{label}' at index {idx}")),
+    }
+}
+
+fn set_i32_result(results: &mut [Val], value: i32) {
+    if let Some(slot) = results.first_mut() {
+        *slot = Val::I32(value);
+    }
+}
+
+fn set_f64_result(results: &mut [Val], value: f64) {
+    if let Some(slot) = results.first_mut() {
+        *slot = Val::F64(value.to_bits());
+    }
+}
+
+fn stub_import(
+    linker: &mut Linker<WasmHostData>,
+    mod_name: &str,
+    imp_name: &str,
+    func_ty: &wasmtime::FuncType,
+) -> Result<(), String> {
+    let result_types: Vec<ValType> = func_ty.results().collect();
+    linker
+        .func_new(
+            mod_name,
+            imp_name,
+            func_ty.clone(),
+            move |_caller: Caller<'_, WasmHostData>, _params: &[Val], results: &mut [Val]| {
+                for (i, ty) in result_types.iter().enumerate() {
+                    results[i] = Val::default_for_ty(ty).unwrap_or(Val::I32(0));
+                }
+                Ok(())
+            },
+        )
+        .map_err(|e| format!("Failed to stub import {mod_name}.{imp_name}: {e}"))?;
+    Ok(())
+}
+
+/// Register the small host import surface PiWasm currently supports.
+/// Any unsupported imports fall back to no-op/default stubs.
+fn register_host_imports(
     linker: &mut Linker<WasmHostData>,
     module: &WasmModule,
 ) -> Result<(), String> {
@@ -255,22 +419,322 @@ fn register_stub_imports(
         let mod_name = import.module();
         let imp_name = import.name();
         if let ExternType::Func(func_ty) = import.ty() {
-            let result_types: Vec<ValType> = func_ty.results().collect();
-            linker
-                .func_new(
-                    mod_name,
-                    imp_name,
-                    func_ty.clone(),
-                    move |_caller: Caller<'_, WasmHostData>,
-                          _params: &[Val],
-                          results: &mut [Val]| {
-                        for (i, ty) in result_types.iter().enumerate() {
-                            results[i] = Val::default_for_ty(ty).unwrap_or(Val::I32(0));
-                        }
-                        Ok(())
-                    },
-                )
-                .map_err(|e| format!("Failed to stub import {mod_name}.{imp_name}: {e}"))?;
+            match imp_name {
+                "__syscall_openat" => {
+                    linker
+                        .func_new(
+                            mod_name,
+                            imp_name,
+                            func_ty.clone(),
+                            move |mut caller, params, results| {
+                                let path_ptr = usize::try_from(val_i32(params, 1, "path")?)
+                                    .map_err(|_| anyhow!("Negative path pointer"))?;
+                                let path = caller_read_c_string(&mut caller, path_ptr)?;
+                                let Some(bytes_len) = caller
+                                    .data()
+                                    .staged_files
+                                    .get(&path)
+                                    .map(std::vec::Vec::len)
+                                else {
+                                    set_i32_result(results, -44);
+                                    return Ok(());
+                                };
+                                let fd = {
+                                    let host = caller.data_mut();
+                                    if host.next_fd == u32::MAX {
+                                        return Err(anyhow!("Synthetic fd space exhausted"));
+                                    }
+                                    let fd = host.next_fd;
+                                    host.next_fd = host.next_fd.saturating_add(1);
+                                    host.open_files.insert(
+                                        fd,
+                                        VirtualFileHandle {
+                                            path: path.clone(),
+                                            position: 0,
+                                        },
+                                    );
+                                    fd
+                                };
+                                debug!(path, bytes = bytes_len, fd, "wasm: staged file open");
+                                set_i32_result(results, i32::try_from(fd).unwrap_or(i32::MAX));
+                                Ok(())
+                            },
+                        )
+                        .map_err(|e| {
+                            format!("Failed to register import {mod_name}.{imp_name}: {e}")
+                        })?;
+                }
+                "fd_read" => {
+                    linker
+                        .func_new(
+                            mod_name,
+                            imp_name,
+                            func_ty.clone(),
+                            move |mut caller, params, results| {
+                                let fd = u32::try_from(val_i32(params, 0, "fd")?)
+                                    .map_err(|_| anyhow!("Negative fd"))?;
+                                let iov = usize::try_from(val_i32(params, 1, "iov")?)
+                                    .map_err(|_| anyhow!("Negative iov pointer"))?;
+                                let iovcnt = usize::try_from(val_i32(params, 2, "iovcnt")?)
+                                    .map_err(|_| anyhow!("Negative iov count"))?;
+                                let pnum = usize::try_from(val_i32(params, 3, "pnum")?)
+                                    .map_err(|_| anyhow!("Negative pnum pointer"))?;
+
+                                let (path, mut position) = match caller.data().open_files.get(&fd) {
+                                    Some(handle) => (handle.path.clone(), handle.position),
+                                    None => {
+                                        set_i32_result(results, 8);
+                                        return Ok(());
+                                    }
+                                };
+
+                                let mut total = 0_usize;
+                                for index in 0..iovcnt {
+                                    let base = iov
+                                        .checked_add(index.saturating_mul(8))
+                                        .ok_or_else(|| anyhow!("iov overflow"))?;
+                                    let ptr = usize::try_from(caller_read_u32(&mut caller, base)?)
+                                        .map_err(|_| anyhow!("iov ptr overflow"))?;
+                                    let len =
+                                        usize::try_from(caller_read_u32(&mut caller, base + 4)?)
+                                            .map_err(|_| anyhow!("iov len overflow"))?;
+                                    let chunk = {
+                                        let host = caller.data();
+                                        let Some(file) = host.staged_files.get(&path) else {
+                                            set_i32_result(results, 44);
+                                            return Ok(());
+                                        };
+                                        if position >= file.len() || len == 0 {
+                                            Vec::new()
+                                        } else {
+                                            let available = file.len().saturating_sub(position);
+                                            let to_copy = available.min(len);
+                                            file[position..position + to_copy].to_vec()
+                                        }
+                                    };
+                                    if chunk.is_empty() {
+                                        break;
+                                    }
+                                    caller_write_bytes(&mut caller, ptr, &chunk)?;
+                                    position += chunk.len();
+                                    total += chunk.len();
+                                    if chunk.len() < len {
+                                        break;
+                                    }
+                                }
+
+                                caller_write_u32(
+                                    &mut caller,
+                                    pnum,
+                                    u32::try_from(total).unwrap_or(u32::MAX),
+                                )?;
+                                if let Some(handle) = caller.data_mut().open_files.get_mut(&fd) {
+                                    handle.position = position;
+                                } else {
+                                    set_i32_result(results, 8);
+                                    return Ok(());
+                                }
+                                set_i32_result(results, 0);
+                                Ok(())
+                            },
+                        )
+                        .map_err(|e| {
+                            format!("Failed to register import {mod_name}.{imp_name}: {e}")
+                        })?;
+                }
+                "fd_seek" => {
+                    linker
+                        .func_new(
+                            mod_name,
+                            imp_name,
+                            func_ty.clone(),
+                            move |mut caller, params, results| {
+                                let fd = u32::try_from(val_i32(params, 0, "fd")?)
+                                    .map_err(|_| anyhow!("Negative fd"))?;
+                                let offset = val_i64(params, 1, "offset")?;
+                                let whence = val_i32(params, 2, "whence")?;
+                                let new_offset_ptr =
+                                    usize::try_from(val_i32(params, 3, "newOffset")?)
+                                        .map_err(|_| anyhow!("Negative newOffset pointer"))?;
+
+                                let (path, current_position) = match caller.data().open_files.get(&fd) {
+                                    Some(handle) => (handle.path.clone(), handle.position),
+                                    None => {
+                                        set_i32_result(results, 8);
+                                        return Ok(());
+                                    }
+                                };
+                                let Some(file_len) = caller
+                                    .data()
+                                    .staged_files
+                                    .get(&path)
+                                    .map(std::vec::Vec::len)
+                                else {
+                                    set_i32_result(results, 44);
+                                    return Ok(());
+                                };
+                                let base = match whence {
+                                    0 => 0_i64,
+                                    1 => i64::try_from(current_position).unwrap_or(i64::MAX),
+                                    2 => i64::try_from(file_len).unwrap_or(i64::MAX),
+                                    _ => {
+                                        set_i32_result(results, 28);
+                                        return Ok(());
+                                    }
+                                };
+                                let next = base
+                                    .checked_add(offset)
+                                    .ok_or_else(|| anyhow!("Seek overflow"))?;
+                                if next < 0 {
+                                    set_i32_result(results, 28);
+                                    return Ok(());
+                                }
+                                let next =
+                                    usize::try_from(next).map_err(|_| anyhow!("Seek overflow"))?;
+                                if let Some(handle) = caller.data_mut().open_files.get_mut(&fd) {
+                                    handle.position = next;
+                                } else {
+                                    set_i32_result(results, 8);
+                                    return Ok(());
+                                }
+                                caller_write_u64(
+                                    &mut caller,
+                                    new_offset_ptr,
+                                    u64::try_from(next).unwrap_or(u64::MAX),
+                                )?;
+                                set_i32_result(results, 0);
+                                Ok(())
+                            },
+                        )
+                        .map_err(|e| {
+                            format!("Failed to register import {mod_name}.{imp_name}: {e}")
+                        })?;
+                }
+                "fd_close" => {
+                    linker
+                        .func_new(
+                            mod_name,
+                            imp_name,
+                            func_ty.clone(),
+                            move |mut caller, params, results| {
+                                let fd = u32::try_from(val_i32(params, 0, "fd")?)
+                                    .map_err(|_| anyhow!("Negative fd"))?;
+                                let result = if caller.data_mut().open_files.remove(&fd).is_some() {
+                                    0
+                                } else {
+                                    8
+                                };
+                                set_i32_result(results, result);
+                                Ok(())
+                            },
+                        )
+                        .map_err(|e| {
+                            format!("Failed to register import {mod_name}.{imp_name}: {e}")
+                        })?;
+                }
+                "fd_write" => {
+                    linker
+                        .func_new(
+                            mod_name,
+                            imp_name,
+                            func_ty.clone(),
+                            move |mut caller, params, results| {
+                                let iov = usize::try_from(val_i32(params, 1, "iov")?)
+                                    .map_err(|_| anyhow!("Negative iov pointer"))?;
+                                let iovcnt = usize::try_from(val_i32(params, 2, "iovcnt")?)
+                                    .map_err(|_| anyhow!("Negative iov count"))?;
+                                let pnum = usize::try_from(val_i32(params, 3, "pnum")?)
+                                    .map_err(|_| anyhow!("Negative pnum pointer"))?;
+                                let mut total = 0_usize;
+                                for index in 0..iovcnt {
+                                    let base = iov
+                                        .checked_add(index.saturating_mul(8))
+                                        .ok_or_else(|| anyhow!("iov overflow"))?;
+                                    total = total.saturating_add(
+                                        usize::try_from(caller_read_u32(&mut caller, base + 4)?)
+                                            .unwrap_or(usize::MAX),
+                                    );
+                                }
+                                caller_write_u32(
+                                    &mut caller,
+                                    pnum,
+                                    u32::try_from(total).unwrap_or(u32::MAX),
+                                )?;
+                                set_i32_result(results, 0);
+                                Ok(())
+                            },
+                        )
+                        .map_err(|e| {
+                            format!("Failed to register import {mod_name}.{imp_name}: {e}")
+                        })?;
+                }
+                "emscripten_get_now" => {
+                    linker
+                        .func_new(
+                            mod_name,
+                            imp_name,
+                            func_ty.clone(),
+                            move |caller, _params, results| {
+                                let elapsed_ms =
+                                    caller.data().started_at.elapsed().as_secs_f64() * 1000.0;
+                                set_f64_result(results, elapsed_ms);
+                                Ok(())
+                            },
+                        )
+                        .map_err(|e| {
+                            format!("Failed to register import {mod_name}.{imp_name}: {e}")
+                        })?;
+                }
+                "emscripten_resize_heap" => {
+                    linker
+                        .func_new(
+                            mod_name,
+                            imp_name,
+                            func_ty.clone(),
+                            move |mut caller, params, results| {
+                                let requested_size =
+                                    usize::try_from(val_i32(params, 0, "requestedSize")?)
+                                        .map_err(|_| anyhow!("Negative heap size"))?;
+                                let memory = caller_memory(&mut caller)?;
+                                let current_size = memory.data_size(&mut caller);
+                                if requested_size <= current_size {
+                                    set_i32_result(results, 1);
+                                    return Ok(());
+                                }
+                                let page_size =
+                                    usize::try_from(memory.page_size(&caller)).unwrap_or(65_536);
+                                let needed_bytes = requested_size.saturating_sub(current_size);
+                                let needed_pages =
+                                    (needed_bytes.saturating_add(page_size - 1)) / page_size;
+                                let current_pages = memory.size(&caller);
+                                let requested_pages = current_pages.saturating_add(
+                                    u64::try_from(needed_pages).unwrap_or(u64::MAX),
+                                );
+                                if requested_pages > caller.data().max_memory_pages {
+                                    set_i32_result(results, 0);
+                                    return Ok(());
+                                }
+                                let grown = memory
+                                    .grow(
+                                        &mut caller,
+                                        u64::try_from(needed_pages).unwrap_or(u64::MAX),
+                                    )
+                                    .is_ok();
+                                set_i32_result(results, if grown { 1 } else { 0 });
+                                Ok(())
+                            },
+                        )
+                        .map_err(|e| {
+                            format!("Failed to register import {mod_name}.{imp_name}: {e}")
+                        })?;
+                }
+                "__syscall_fcntl64" | "__syscall_ioctl" | "__syscall_mkdirat"
+                | "__syscall_renameat" | "__syscall_rmdir" | "__syscall_unlinkat"
+                | "_emscripten_system" | "exit" => {
+                    stub_import(linker, mod_name, imp_name, &func_ty)?;
+                }
+                _ => stub_import(linker, mod_name, imp_name, &func_ty)?,
+            }
         } else {
             // Non-function imports are currently skipped for MVP.
         }
@@ -331,6 +795,23 @@ pub(crate) fn inject_wasm_globals(
         )?;
     }
 
+    // ---- __pi_wasm_stage_file_native(path, bytes) → byte_length ----
+    {
+        let st = Rc::clone(state);
+        global.set(
+            "__pi_wasm_stage_file_native",
+            Func::from(
+                move |ctx: Ctx<'_>, path: String, bytes_val: Value<'_>| -> rquickjs::Result<u32> {
+                    let bytes = extract_bytes(&ctx, &bytes_val)?;
+                    let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+                    debug!(path = %path, len_bytes = bytes.len(), "wasm: staged file");
+                    st.borrow_mut().staged_files.insert(path, bytes);
+                    Ok(len)
+                },
+            ),
+        )?;
+    }
+
     // ---- __pi_wasm_instantiate_native(module_id) → instance_id ----
     {
         let st = Rc::clone(state);
@@ -353,13 +834,17 @@ pub(crate) fn inject_wasm_globals(
                         .clone();
 
                     let mut linker = Linker::new(&bridge.engine);
-                    register_stub_imports(&mut linker, &module)
+                    register_host_imports(&mut linker, &module)
                         .map_err(|e| throw_wasm(&ctx, "LinkError", &e))?;
 
                     let mut store = Store::new(
                         &bridge.engine,
                         WasmHostData {
                             max_memory_pages: DEFAULT_MAX_MEMORY_PAGES,
+                            staged_files: bridge.staged_files.clone(),
+                            open_files: HashMap::new(),
+                            next_fd: 3,
+                            started_at: Instant::now(),
                         },
                     );
                     let instance = linker
@@ -488,6 +973,72 @@ pub(crate) fn inject_wasm_globals(
         )?;
     }
 
+    // ---- __pi_wasm_memory_read_native(instance_id, mem_name, offset, len) → ArrayBuffer ----
+    {
+        let st = Rc::clone(state);
+        global.set(
+            "__pi_wasm_memory_read_native",
+            Func::from(
+                move |ctx: Ctx<'_>,
+                      instance_id: u32,
+                      mem_name: String,
+                      offset: u32,
+                      len: u32|
+                      -> rquickjs::Result<Value<'_>> {
+                    let mut bridge = st.borrow_mut();
+                    let inst = bridge
+                        .instances
+                        .get_mut(&instance_id)
+                        .ok_or_else(|| throw_wasm(&ctx, "RuntimeError", "Instance not found"))?;
+                    let memory = instance_memory(inst, &mem_name)
+                        .map_err(|e| throw_wasm(&ctx, "RuntimeError", &e))?;
+                    let start = usize::try_from(offset)
+                        .map_err(|_| throw_wasm(&ctx, "RuntimeError", "Offset overflow"))?;
+                    let len = usize::try_from(len)
+                        .map_err(|_| throw_wasm(&ctx, "RuntimeError", "Length overflow"))?;
+                    let data = memory.data(&inst.store);
+                    let range = checked_memory_range(start, len, data.len())
+                        .map_err(|e| throw_wasm(&ctx, "RuntimeError", &e))?;
+                    let buffer = ArrayBuffer::new_copy(ctx.clone(), &data[range])?;
+                    Ok(buffer.into_value())
+                },
+            ),
+        )?;
+    }
+
+    // ---- __pi_wasm_memory_write_native(instance_id, mem_name, offset, bytes) → byte_length ----
+    {
+        let st = Rc::clone(state);
+        global.set(
+            "__pi_wasm_memory_write_native",
+            Func::from(
+                move |ctx: Ctx<'_>,
+                      instance_id: u32,
+                      mem_name: String,
+                      offset: u32,
+                      bytes_val: Value<'_>|
+                      -> rquickjs::Result<u32> {
+                    let bytes = extract_bytes(&ctx, &bytes_val)?;
+                    let mut bridge = st.borrow_mut();
+                    let inst = bridge
+                        .instances
+                        .get_mut(&instance_id)
+                        .ok_or_else(|| throw_wasm(&ctx, "RuntimeError", "Instance not found"))?;
+                    let memory = instance_memory(inst, &mem_name)
+                        .map_err(|e| throw_wasm(&ctx, "RuntimeError", &e))?;
+                    let start = usize::try_from(offset)
+                        .map_err(|_| throw_wasm(&ctx, "RuntimeError", "Offset overflow"))?;
+                    let _ = checked_memory_range(start, bytes.len(), memory.data_size(&mut inst.store))
+                        .map_err(|e| throw_wasm(&ctx, "RuntimeError", &e))?;
+                    memory
+                        .write(&mut inst.store, start, &bytes)
+                        .map_err(|e| throw_wasm(&ctx, "RuntimeError", &e.to_string()))?;
+                    Ok(u32::try_from(bytes.len()).unwrap_or(u32::MAX))
+                },
+            ),
+        )?;
+    }
+
     // ---- __pi_wasm_get_buffer_native(instance_id, mem_name) → stores ArrayBuffer in global ----
     {
         let st = Rc::clone(state);
@@ -501,10 +1052,8 @@ pub(crate) fn inject_wasm_globals(
                         .get_mut(&instance_id)
                         .ok_or_else(|| throw_wasm(&ctx, "RuntimeError", "Instance not found"))?;
                     let started = Instant::now();
-                    let memory = inst
-                        .instance
-                        .get_memory(&mut inst.store, &mem_name)
-                        .ok_or_else(|| throw_wasm(&ctx, "RuntimeError", "Memory not found"))?;
+                    let memory = instance_memory(inst, &mem_name)
+                        .map_err(|e| throw_wasm(&ctx, "RuntimeError", &e))?;
                     let data = memory.data(&inst.store);
                     let len = i32::try_from(data.len()).unwrap_or(i32::MAX);
                     let buffer = ArrayBuffer::new_copy(ctx.clone(), data)?;
@@ -711,6 +1260,9 @@ const WASM_POLYFILL_JS: &str = r#"
         var exports = buildExports(instanceId);
         var instance = { exports: exports };
         var wasmMod = { __wasm_module_id: moduleId };
+        globalThis.__pi_wasm_last_instance_id = instanceId;
+        instance.__pi_instance_id = instanceId;
+        exports.__pi_instance_id = instanceId;
 
         if (source && typeof source === "object" && source.__wasm_module_id !== undefined) {
           return syncResolve(instance);
