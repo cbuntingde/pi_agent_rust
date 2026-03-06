@@ -652,12 +652,12 @@ impl PiApp {
                 self.extension_custom_overlay = Some(ExtensionCustomOverlay::default());
             }
             if let Some(overlay) = self.extension_custom_overlay.as_mut() {
-                overlay.extension_id.clone_from(&request.extension_id);
-                overlay.title = request
-                    .payload
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .map(std::string::ToString::to_string);
+                if request.extension_id.is_some() {
+                    overlay.extension_id.clone_from(&request.extension_id);
+                }
+                if let Some(title) = request.payload.get("title") {
+                    overlay.title = title.as_str().map(std::string::ToString::to_string);
+                }
             }
         }
 
@@ -890,15 +890,18 @@ impl PiApp {
         }
 
         self.extension_custom_active = true;
-        self.extension_custom_overlay = Some(ExtensionCustomOverlay {
-            extension_id: request.extension_id.clone(),
-            title: request
-                .payload
-                .get("title")
-                .and_then(Value::as_str)
-                .map(std::string::ToString::to_string),
-            lines,
-        });
+        if self.extension_custom_overlay.is_none() {
+            self.extension_custom_overlay = Some(ExtensionCustomOverlay::default());
+        }
+        if let Some(overlay) = self.extension_custom_overlay.as_mut() {
+            if request.extension_id.is_some() {
+                overlay.extension_id.clone_from(&request.extension_id);
+            }
+            if let Some(title) = request.payload.get("title") {
+                overlay.title = title.as_str().map(std::string::ToString::to_string);
+            }
+            overlay.lines = lines;
+        }
     }
 
     fn apply_extension_title_effect(&mut self, request: &ExtensionUiRequest) {
@@ -1827,6 +1830,57 @@ mod stream_delta_batcher_tests {
             app.extension_custom_active,
             "empty frame must not silently deactivate custom UI input handling"
         );
+    }
+
+    #[test]
+    fn custom_overlay_poll_without_title_preserves_existing_title() {
+        let mut app = build_test_app();
+        let initial_request = ExtensionUiRequest::new(
+            "req-open",
+            "custom",
+            json!({ "title": "Snake", "overlay": true }),
+        )
+        .with_extension_id(Some("snake".to_string()));
+        app.handle_custom_extension_ui_request(initial_request);
+
+        let poll_request = ExtensionUiRequest::new(
+            "req-poll",
+            "custom",
+            json!({ "mode": "poll", "widgetKey": "__pi_custom_overlay" }),
+        )
+        .with_extension_id(Some("snake".to_string()));
+        app.handle_custom_extension_ui_request(poll_request);
+
+        let overlay = app
+            .extension_custom_overlay
+            .as_ref()
+            .expect("poll should keep custom overlay alive");
+        assert_eq!(overlay.title.as_deref(), Some("Snake"));
+        assert!(app.extension_custom_active);
+    }
+
+    #[test]
+    fn custom_overlay_frame_without_title_preserves_existing_title() {
+        let mut app = build_test_app();
+        let poll_request = ExtensionUiRequest::new(
+            "req-poll",
+            "custom",
+            json!({ "title": "Snake", "overlay": true }),
+        )
+        .with_extension_id(Some("snake".to_string()));
+        app.handle_custom_extension_ui_request(poll_request);
+
+        let frame_request =
+            ExtensionUiRequest::new("req-frame", "setWidget", json!({ "lines": ["score: 1"] }))
+                .with_extension_id(Some("snake".to_string()));
+        app.apply_custom_overlay_widget_effect(&frame_request, vec!["score: 1".to_string()]);
+
+        let overlay = app
+            .extension_custom_overlay
+            .as_ref()
+            .expect("frame update should keep custom overlay alive");
+        assert_eq!(overlay.title.as_deref(), Some("Snake"));
+        assert_eq!(overlay.lines, vec!["score: 1".to_string()]);
     }
 
     #[test]
