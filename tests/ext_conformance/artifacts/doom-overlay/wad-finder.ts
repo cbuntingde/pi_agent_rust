@@ -43,21 +43,24 @@ export async function ensureWadFile(onProgress?: (message: string) => void): Pro
 	}
 
 	// Download to bundled location
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(new Error("WAD download timed out")), WAD_DOWNLOAD_TIMEOUT_MS);
 	try {
 		onProgress?.(`Downloading DOOM WAD from ${WAD_URL}...`);
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(new Error("WAD download timed out")), WAD_DOWNLOAD_TIMEOUT_MS);
 		const response = await fetch(WAD_URL, { signal: controller.signal });
-		clearTimeout(timer);
 		if (!response.ok) {
 			throw new Error(`HTTP ${response.status}`);
 		}
+		onProgress?.(`DOOM WAD response status: ${response.status}`);
 		const buffer = await response.arrayBuffer();
+		onProgress?.(`DOOM WAD bytes received: ${buffer.byteLength}`);
 		writeFileSync(BUNDLED_WAD, Buffer.from(buffer));
 		onProgress?.(`Downloaded DOOM WAD (${buffer.byteLength} bytes)`);
 		return BUNDLED_WAD;
 	} catch (error) {
 		onProgress?.(`DOOM WAD download failed: ${String(error)}`);
 		return null;
+	} finally {
+		clearTimeout(timer);
 	}
 }
