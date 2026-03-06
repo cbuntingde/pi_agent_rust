@@ -261,12 +261,11 @@ impl PackageManager {
         match parsed {
             ParsedSource::Npm { spec, .. } => self.install_npm(&spec, scope),
             ParsedSource::Git {
-                repo,
-                host,
-                path,
-                r#ref,
-                ..
-            } => self.install_git(&repo, &host, &path, r#ref.as_deref(), scope),
+                host, path, r#ref, ..
+            } => {
+                let clone_source = git_clone_source(source, &self.cwd);
+                self.install_git(&clone_source, &host, &path, r#ref.as_deref(), scope)
+            }
             ParsedSource::Local { path } => {
                 if path.exists() {
                     Ok(())
@@ -336,14 +335,11 @@ impl PackageManager {
                 }
             }
             ParsedSource::Git {
-                repo,
-                host,
-                path,
-                pinned,
-                ..
+                host, path, pinned, ..
             } => {
                 if !pinned {
-                    self.update_git(&repo, &host, &path, scope)?;
+                    let clone_source = git_clone_source(source, &self.cwd);
+                    self.update_git(&clone_source, &host, &path, scope)?;
                 }
             }
             ParsedSource::Local { .. } => {}
@@ -741,7 +737,7 @@ impl PackageManager {
                 ));
             }
         };
-        update_package_sources(&path, source, UpdateAction::Add)
+        update_package_sources(&path, source, UpdateAction::Add, &self.cwd)
     }
 
     pub async fn remove_package_source(&self, source: &str, scope: PackageScope) -> Result<()> {
@@ -771,7 +767,7 @@ impl PackageManager {
                 ));
             }
         };
-        update_package_sources(&path, source, UpdateAction::Remove)
+        update_package_sources(&path, source, UpdateAction::Remove, &self.cwd)
     }
 
     fn lockfile_path_for_scope(&self, scope: PackageScope) -> Option<PathBuf> {
@@ -2753,13 +2749,158 @@ fn resolve_install_source_alias(source: &str, cwd: &Path) -> Option<String> {
     }
 }
 
-fn parse_git_source(spec: &str, cwd: &Path) -> ParsedSource {
-    let mut parts = spec.split('@');
-    let repo_raw = parts.next().unwrap_or("").trim();
-    let r#ref = parts
+fn git_clone_source(source: &str, cwd: &Path) -> String {
+    let spec = source.trim().strip_prefix("git:").unwrap_or(source).trim();
+    let (repo_raw, _) = split_git_spec_ref(spec);
+    if looks_like_local_path(repo_raw) {
+        local_path_from_spec(repo_raw, cwd)
+            .to_string_lossy()
+            .to_string()
+    } else {
+        repo_raw.to_string()
+    }
+}
+
+// Trailing `@ref` is part of Pi's git source syntax, but authenticated HTTPS
+// URLs and SCP-like SSH specs also contain `@` in the authority section.
+fn split_git_spec_ref(spec: &str) -> (&str, Option<&str>) {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return ("", None);
+    }
+
+    if looks_like_local_path(spec) {
+        let mut parts = spec.splitn(2, '@');
+        let repo = parts.next().unwrap_or("").trim();
+        let r#ref = parts.next().map(str::trim).filter(|part| !part.is_empty());
+        return (repo, r#ref);
+    }
+
+    let reserved_prefix_end = git_ref_reserved_prefix_end(spec);
+    for (idx, _) in spec.match_indices('@').rev() {
+        if idx < reserved_prefix_end {
+            continue;
+        }
+        let repo = spec[..idx].trim();
+        let r#ref = spec[idx + 1..].trim();
+        if !repo.is_empty() && !r#ref.is_empty() {
+            return (repo, Some(r#ref));
+        }
+    }
+
+    (spec, None)
+}
+
+fn git_ref_reserved_prefix_end(spec: &str) -> usize {
+    if let Some(scheme_idx) = spec.find("://") {
+        let authority_start = scheme_idx + 3;
+        return spec[authority_start..]
+            .find('/')
+            .map_or(spec.len(), |idx| authority_start + idx);
+    }
+
+    if let Some(at_idx) = spec.find('@') {
+        let tail = &spec[at_idx + 1..];
+        if let Some(colon_idx) = tail.find(':') {
+            let slash_idx = tail.find('/');
+            if slash_idx.is_none_or(|slash| colon_idx < slash) {
+                return at_idx + 1 + colon_idx;
+            }
+        }
+    }
+
+    0
+}
+
+// Normalize clone sources into a stable repo identity without leaking URL
+// userinfo into install paths, trust records, or source matching.
+fn normalize_remote_git_repo(repo_raw: &str) -> (String, String, String) {
+    let repo_raw = repo_raw.trim();
+
+    if let Ok(url) = url::Url::parse(repo_raw) {
+        let host = url.host_str().unwrap_or("").to_string();
+        let path = url
+            .path()
+            .trim_matches('/')
+            .trim_end_matches(".git")
+            .to_string();
+        let repo = if path.is_empty() {
+            host.clone()
+        } else {
+            format!("{host}/{path}")
+        };
+        return (repo, host, path);
+    }
+
+    if !repo_raw.contains("://") {
+        let first_slash = repo_raw.find('/');
+        if let Some(colon_idx) = repo_raw.find(':') {
+            if first_slash.is_none_or(|slash| colon_idx < slash) {
+                let host_part = &repo_raw[..colon_idx];
+                if let Some(at_idx) = host_part.rfind('@') {
+                    let host = host_part[at_idx + 1..].trim().to_string();
+                    let path = repo_raw[colon_idx + 1..]
+                        .trim()
+                        .trim_matches('/')
+                        .trim_end_matches(".git")
+                        .to_string();
+                    let repo = if path.is_empty() {
+                        host.clone()
+                    } else {
+                        format!("{host}/{path}")
+                    };
+                    return (repo, host, path);
+                }
+            }
+        }
+    }
+
+    let normalized = repo_raw
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches(".git")
+        .to_string();
+
+    let segments = normalized
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != "." && *segment != "..")
+        .collect::<Vec<_>>();
+
+    let host = segments
+        .first()
+        .copied()
+        .unwrap_or("")
+        .rsplit('@')
         .next()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+        .unwrap_or("")
+        .to_string();
+    let path = if segments.len() >= 2 {
+        segments[1..].join("/")
+    } else {
+        String::new()
+    };
+    let repo = if path.is_empty() {
+        host.clone()
+    } else {
+        format!("{host}/{path}")
+    };
+
+    (repo, host, path)
+}
+
+fn normalized_git_repo_key(spec: &str) -> String {
+    let (repo_raw, _) = split_git_spec_ref(spec);
+    if looks_like_local_path(repo_raw) {
+        repo_raw.to_string()
+    } else {
+        let (repo, _, _) = normalize_remote_git_repo(repo_raw);
+        repo
+    }
+}
+
+fn parse_git_source(spec: &str, cwd: &Path) -> ParsedSource {
+    let (repo_raw, parsed_ref) = split_git_spec_ref(spec);
+    let r#ref = parsed_ref.map(str::to_string);
     let pinned = r#ref.is_some();
 
     let (repo, host, path) = if looks_like_local_path(repo_raw) {
@@ -2778,25 +2919,7 @@ fn parse_git_source(spec: &str, cwd: &Path) -> ParsedSource {
             key,
         )
     } else {
-        let normalized = repo_raw
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .trim_end_matches(".git")
-            .to_string();
-
-        let segments = normalized
-            .split('/')
-            .filter(|s| !s.is_empty() && *s != "." && *s != "..")
-            .collect::<Vec<_>>();
-
-        let host = segments.first().copied().unwrap_or("").to_string();
-        let path = if segments.len() >= 2 {
-            segments[1..].join("/")
-        } else {
-            String::new()
-        };
-
-        (normalized, host, path)
+        normalize_remote_git_repo(repo_raw)
     };
 
     ParsedSource::Git {
@@ -3312,7 +3435,12 @@ fn list_packages_in_settings(path: &Path) -> Result<Vec<PackageEntry>> {
     Ok(out)
 }
 
-fn update_package_sources(path: &Path, source: &str, action: UpdateAction) -> Result<()> {
+fn update_package_sources(
+    path: &Path,
+    source: &str,
+    action: UpdateAction,
+    cwd: &Path,
+) -> Result<()> {
     let source = source.trim();
     if source.is_empty() {
         return Err(Error::Config(
@@ -3339,7 +3467,8 @@ fn update_package_sources(path: &Path, source: &str, action: UpdateAction) -> Re
     match action {
         UpdateAction::Add => {
             let exists = packages.iter().any(|existing| {
-                extract_package_source(existing).is_some_and(|(s, _)| sources_match(&s, source))
+                extract_package_source(existing)
+                    .is_some_and(|(s, _)| sources_match_in_dir(&s, source, cwd))
             });
             if !exists {
                 packages.push(Value::String(source.to_string()));
@@ -3347,7 +3476,8 @@ fn update_package_sources(path: &Path, source: &str, action: UpdateAction) -> Re
         }
         UpdateAction::Remove => {
             packages.retain(|existing| {
-                !extract_package_source(existing).is_some_and(|(s, _)| sources_match(&s, source))
+                !extract_package_source(existing)
+                    .is_some_and(|(s, _)| sources_match_in_dir(&s, source, cwd))
             });
         }
     }
@@ -3381,6 +3511,11 @@ fn sources_match(a: &str, b: &str) -> bool {
     normalize_source(a).is_some_and(|left| normalize_source(b).is_some_and(|right| left == right))
 }
 
+fn sources_match_in_dir(a: &str, b: &str, cwd: &Path) -> bool {
+    normalize_source_in_dir(a, cwd)
+        .is_some_and(|left| normalize_source_in_dir(b, cwd).is_some_and(|right| left == right))
+}
+
 fn normalize_source(source: &str) -> Option<NormalizedSource> {
     let source = source.trim();
     if source.is_empty() {
@@ -3395,32 +3530,46 @@ fn normalize_source(source: &str) -> Option<NormalizedSource> {
         });
     }
     if let Some(rest) = source.strip_prefix("git:") {
-        let repo = rest.trim().split('@').next().unwrap_or("");
-        let normalized = repo
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .trim_end_matches(".git");
         return Some(NormalizedSource {
             kind: NormalizedKind::Git,
-            key: normalized.to_string(),
+            key: normalized_git_repo_key(rest.trim()),
         });
     }
     if looks_like_git_url(source) || source.starts_with("https://") || source.starts_with("http://")
     {
-        let repo = source.split('@').next().unwrap_or("");
-        let normalized = repo
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .trim_end_matches(".git");
         return Some(NormalizedSource {
             kind: NormalizedKind::Git,
-            key: normalized.to_string(),
+            key: normalized_git_repo_key(source),
         });
     }
     Some(NormalizedSource {
         kind: NormalizedKind::Local,
         key: source.to_string(),
     })
+}
+
+fn normalize_source_in_dir(source: &str, cwd: &Path) -> Option<NormalizedSource> {
+    let source = source.trim();
+    if source.is_empty() {
+        return None;
+    }
+
+    // Settings dedupe/removal should follow install-time source resolution so equivalent local
+    // paths and shorthand aliases collapse to the same package entry.
+    match parse_source(source, cwd) {
+        ParsedSource::Npm { name, .. } => Some(NormalizedSource {
+            kind: NormalizedKind::Npm,
+            key: name,
+        }),
+        ParsedSource::Git { repo, .. } => Some(NormalizedSource {
+            kind: NormalizedKind::Git,
+            key: repo,
+        }),
+        ParsedSource::Local { path } => Some(NormalizedSource {
+            kind: NormalizedKind::Local,
+            key: path.to_string_lossy().to_string(),
+        }),
+    }
 }
 
 fn read_settings_json(path: &Path) -> Result<Value> {
@@ -3546,6 +3695,10 @@ mod tests {
             "https://github.com/a/b.git@v1",
             "github.com/a/b"
         ));
+        assert!(sources_match(
+            "git:https://token-a@github.com/a/b.git@v1",
+            "git:https://token-b@github.com/a/b.git@v2"
+        ));
         assert!(!sources_match("npm:foo", "npm:bar"));
         assert!(!sources_match("git:github.com/a/b", "git:github.com/a/c"));
     }
@@ -3562,6 +3715,10 @@ mod tests {
         );
         assert_eq!(
             manager.package_identity("git:https://github.com/a/b.git@v1"),
+            "git:github.com/a/b"
+        );
+        assert_eq!(
+            manager.package_identity("git:https://token@github.com/a/b.git@v1"),
             "git:github.com/a/b"
         );
 
@@ -3617,6 +3774,15 @@ mod tests {
                 .join("github.com")
                 .join("user/repo")
         );
+
+        let git_with_auth = manager
+            .installed_path_sync(
+                "git:https://token@github.com/user/repo.git@main",
+                PackageScope::Project,
+            )
+            .expect("installed_path")
+            .expect("path");
+        assert_eq!(git_with_auth, git);
     }
 
     #[test]
@@ -4316,6 +4482,13 @@ mod tests {
     }
 
     #[test]
+    fn normalize_source_git_https_with_userinfo_and_ref() {
+        let result = normalize_source("git:https://token@github.com/user/repo.git@v2").unwrap();
+        assert_eq!(result.kind, NormalizedKind::Git);
+        assert_eq!(result.key, "github.com/user/repo");
+    }
+
+    #[test]
     fn normalize_source_local() {
         let result = normalize_source("my-local-package").unwrap();
         assert_eq!(result.kind, NormalizedKind::Local);
@@ -4486,19 +4659,20 @@ mod tests {
         let path = dir.path().join("settings.json");
         fs::write(&path, "{}").expect("write initial");
 
-        update_package_sources(&path, "npm:foo", UpdateAction::Add).expect("add");
+        update_package_sources(&path, "npm:foo", UpdateAction::Add, dir.path()).expect("add");
         let settings = read_settings_json(&path).expect("read");
         let packages = settings["packages"].as_array().expect("packages array");
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0], json!("npm:foo"));
 
         // Adding same source again should not duplicate
-        update_package_sources(&path, "npm:foo@2.0", UpdateAction::Add).expect("add again");
+        update_package_sources(&path, "npm:foo@2.0", UpdateAction::Add, dir.path())
+            .expect("add again");
         let settings = read_settings_json(&path).expect("read");
         let packages = settings["packages"].as_array().expect("packages array");
         assert_eq!(packages.len(), 1, "duplicate source should not be added");
 
-        update_package_sources(&path, "npm:foo", UpdateAction::Remove).expect("remove");
+        update_package_sources(&path, "npm:foo", UpdateAction::Remove, dir.path()).expect("remove");
         let settings = read_settings_json(&path).expect("read");
         let packages = settings["packages"].as_array().expect("packages array");
         assert!(packages.is_empty());
@@ -4517,7 +4691,7 @@ mod tests {
         )
         .expect("write malformed settings");
 
-        update_package_sources(&path, "npm:foo", UpdateAction::Add).expect("add");
+        update_package_sources(&path, "npm:foo", UpdateAction::Add, dir.path()).expect("add");
         let settings = read_settings_json(&path).expect("read");
         let packages = settings["packages"].as_array().expect("packages array");
         assert_eq!(packages, &vec![json!("npm:foo")]);
@@ -4529,7 +4703,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         fs::write(&path, "[]").expect("write malformed root");
 
-        update_package_sources(&path, "npm:foo", UpdateAction::Add).expect("add");
+        update_package_sources(&path, "npm:foo", UpdateAction::Add, dir.path()).expect("add");
         let settings = read_settings_json(&path).expect("read");
         let packages = settings["packages"].as_array().expect("packages array");
         assert_eq!(packages, &vec![json!("npm:foo")]);
@@ -4541,7 +4715,8 @@ mod tests {
         let path = dir.path().join("settings.json");
         fs::write(&path, "{}").expect("write initial");
 
-        let err = update_package_sources(&path, "   ", UpdateAction::Add).expect_err("must fail");
+        let err = update_package_sources(&path, "   ", UpdateAction::Add, dir.path())
+            .expect_err("must fail");
         assert!(
             err.to_string()
                 .contains("settings package source cannot be empty"),
@@ -4553,6 +4728,39 @@ mod tests {
             settings.get("packages").is_none(),
             "failed update must not mutate packages"
         );
+    }
+
+    #[test]
+    fn update_package_sources_deduplicates_equivalent_local_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "{}").expect("write initial");
+
+        update_package_sources(&path, "./foo/../bar", UpdateAction::Add, dir.path()).expect("add");
+        update_package_sources(&path, "./bar", UpdateAction::Add, dir.path()).expect("add again");
+
+        let settings = read_settings_json(&path).expect("read");
+        let packages = settings["packages"].as_array().expect("packages array");
+        assert_eq!(
+            packages.len(),
+            1,
+            "equivalent local paths should deduplicate"
+        );
+        assert_eq!(packages[0], json!("./foo/../bar"));
+    }
+
+    #[test]
+    fn update_package_sources_remove_matches_equivalent_local_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "{}").expect("write initial");
+
+        update_package_sources(&path, "./foo/../bar", UpdateAction::Add, dir.path()).expect("add");
+        update_package_sources(&path, "./bar", UpdateAction::Remove, dir.path()).expect("remove");
+
+        let settings = read_settings_json(&path).expect("read");
+        let packages = settings["packages"].as_array().expect("packages array");
+        assert!(packages.is_empty(), "equivalent local paths should remove");
     }
 
     // ======================================================================
@@ -4732,6 +4940,30 @@ mod tests {
                 assert_eq!(host, "github.com");
             }
             other => panic!(),
+        }
+    }
+
+    #[test]
+    fn parse_source_https_github_url_with_userinfo_and_ref() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        match parse_source(
+            "git:https://token@github.com/user/repo.git@main",
+            dir.path(),
+        ) {
+            ParsedSource::Git {
+                repo,
+                host,
+                path,
+                r#ref,
+                pinned,
+            } => {
+                assert_eq!(repo, "github.com/user/repo");
+                assert_eq!(host, "github.com");
+                assert_eq!(path, "user/repo");
+                assert_eq!(r#ref, Some("main".to_string()));
+                assert!(pinned);
+            }
+            other => panic!("Unexpected parsed source: {:?}", other),
         }
     }
 
