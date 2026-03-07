@@ -3743,8 +3743,8 @@ mod tests {
     fn test_finish_package_task_maps_nonpanic_cancellation_to_tool_error() {
         let handle = std::thread::spawn(|| {});
 
-        let err =
-            finish_package_task(handle, Err(()), "Install task cancelled").expect_err("error");
+        let err = finish_package_task::<(), _>(handle, Err(()), "Install task cancelled")
+            .expect_err("error");
 
         assert!(
             err.to_string().contains("Install task cancelled"),
@@ -3756,7 +3756,8 @@ mod tests {
     fn test_finish_package_task_returns_success_payload() {
         let handle = std::thread::spawn(|| {});
 
-        let value = finish_package_task(handle, Ok(Ok(7usize)), "task cancelled").unwrap();
+        let value =
+            finish_package_task::<usize, ()>(handle, Ok(Ok(7usize)), "task cancelled").unwrap();
 
         assert_eq!(value, 7);
     }

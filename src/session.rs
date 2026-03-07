@@ -8264,7 +8264,8 @@ mod tests {
     fn crash_finish_worker_result_returns_success_payload() {
         let handle = thread::spawn(|| {});
 
-        let value = finish_worker_result(handle, Ok(Ok(7usize)), "task cancelled").unwrap();
+        let value =
+            finish_worker_result::<usize, ()>(handle, Ok(Ok(7usize)), "task cancelled").unwrap();
 
         assert_eq!(value, 7);
     }
