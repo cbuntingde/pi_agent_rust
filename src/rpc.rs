@@ -579,22 +579,8 @@ pub async fn run(
                     };
 
                 let expanded = options.resources.expand_input(&message);
-                let extension_command = if is_extension_command(&message, &expanded) {
-                    let guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    resolve_extension_command(
-                        &message,
-                        &expanded,
-                        guard
-                            .extensions
-                            .as_ref()
-                            .map(crate::extensions::ExtensionRegion::manager),
-                    )
-                } else {
-                    None
-                };
+                let extension_command =
+                    resolve_extension_command(&message, &expanded, rpc_extension_manager.as_ref());
 
                 if is_streaming.load(Ordering::SeqCst) {
                     if extension_command.is_some() {
@@ -4175,13 +4161,22 @@ mod tests {
     use super::*;
     use crate::auth::AuthCredential;
     use crate::model::{
-        ContentBlock, ImageContent, TextContent, ThinkingLevel, UserContent, UserMessage,
+        AssistantMessage, ContentBlock, ImageContent, StopReason, TextContent, ThinkingLevel,
+        Usage, UserContent, UserMessage,
     };
-    use crate::provider::{InputType, Model, ModelCost};
+    use crate::provider::{InputType, Model, ModelCost, Provider};
+    use crate::resources::ResourceLoader;
     use crate::session::Session;
+    use crate::tools::ToolRegistry;
+    use async_trait::async_trait;
+    use futures::stream;
     use serde_json::json;
     use std::collections::HashMap;
-    use std::time::Instant;
+    use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::sync::mpsc::{Receiver, TryRecvError};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     // -----------------------------------------------------------------------
     // Helper builders
@@ -4241,6 +4236,220 @@ mod tests {
             runtime_handle,
         }
     }
+
+    #[derive(Debug)]
+    struct NoopProvider;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for NoopProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            let message = AssistantMessage {
+                content: Vec::new(),
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(crate::model::StreamEvent::Start {
+                    partial: message.clone(),
+                }),
+                Ok(crate::model::StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                }),
+            ])))
+        }
+    }
+
+    fn build_test_agent_session(session: Session) -> AgentSession {
+        let provider: Arc<dyn Provider> = Arc::new(NoopProvider);
+        let tools = ToolRegistry::new(&[], &std::env::current_dir().expect("current dir"), None);
+        let agent = crate::agent::Agent::new(provider, tools, crate::agent::AgentConfig::default());
+        let session = Arc::new(asupersync::sync::Mutex::new(session));
+        AgentSession::new(
+            agent,
+            session,
+            false,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        )
+    }
+
+    fn build_test_rpc_options(
+        handle: &asupersync::runtime::RuntimeHandle,
+        auth_path: PathBuf,
+    ) -> RpcOptions {
+        let auth = AuthStorage::load(auth_path).expect("load auth storage");
+        RpcOptions {
+            config: Config::default(),
+            resources: ResourceLoader::empty(false),
+            available_models: Vec::new(),
+            scoped_models: Vec::new(),
+            auth,
+            runtime_handle: handle.clone(),
+        }
+    }
+
+    async fn recv_line(
+        rx: &Arc<Mutex<Receiver<String>>>,
+        label: &str,
+    ) -> std::result::Result<String, String> {
+        let start = Instant::now();
+        loop {
+            let recv_result = {
+                let rx = rx.lock().expect("lock rpc output receiver");
+                rx.try_recv()
+            };
+
+            match recv_result {
+                Ok(line) => return Ok(line),
+                Err(TryRecvError::Disconnected) => {
+                    return Err(format!("{label}: output channel disconnected"));
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+
+            if start.elapsed() > Duration::from_secs(10) {
+                return Err(format!("{label}: timed out waiting for output"));
+            }
+
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(5)).await;
+        }
+    }
+
+    fn parse_response(line: &str) -> Value {
+        serde_json::from_str(line.trim()).expect("parse JSON response")
+    }
+
+    async fn recv_response(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Value {
+        let start = Instant::now();
+
+        loop {
+            let line = recv_line(out_rx, label)
+                .await
+                .unwrap_or_else(|err| panic!("{err}"));
+            let value = parse_response(&line);
+
+            match value.get("type").and_then(Value::as_str) {
+                Some("response") => return value,
+                Some("agent_end") => {
+                    let has_error = value
+                        .get("error")
+                        .is_some_and(|error| !error.is_null() && error != "");
+                    assert!(
+                        !has_error,
+                        "{label}: unexpected agent_end error while waiting for response: {value}"
+                    );
+                }
+                _ => {}
+            }
+
+            assert!(
+                start.elapsed() <= Duration::from_secs(10),
+                "{label}: timed out waiting for RPC response"
+            );
+        }
+    }
+
+    async fn send_recv(
+        in_tx: &asupersync::channel::mpsc::Sender<String>,
+        out_rx: &Arc<Mutex<Receiver<String>>>,
+        cmd: &str,
+        label: &str,
+    ) -> Value {
+        let cx = asupersync::Cx::for_testing();
+        in_tx
+            .send(&cx, cmd.to_string())
+            .await
+            .unwrap_or_else(|_| panic!("send {label}"));
+        recv_response(out_rx, label).await
+    }
+
+    fn assert_ok(resp: &Value, command: &str) {
+        assert_eq!(resp["type"], "response", "response type for {command}");
+        assert_eq!(resp["command"], command);
+        assert_eq!(resp["success"], true, "success for {command}: {resp}");
+    }
+
+    fn assert_err(resp: &Value, command: &str) {
+        assert_eq!(resp["type"], "response", "response type for {command}");
+        assert_eq!(resp["command"], command);
+        assert_eq!(
+            resp["success"], false,
+            "expected error for {command}: {resp}"
+        );
+    }
+
+    async fn recv_ui_request(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Value {
+        let start = Instant::now();
+        loop {
+            let recv_result = {
+                let rx = out_rx.lock().expect("lock rpc output receiver");
+                rx.try_recv()
+            };
+
+            match recv_result {
+                Ok(line) => {
+                    if let Ok(val) = serde_json::from_str::<Value>(&line) {
+                        if val.get("type").and_then(Value::as_str) == Some("extension_ui_request") {
+                            return val;
+                        }
+                    }
+                }
+                Err(TryRecvError::Disconnected) => {
+                    panic!(
+                        "{label}: output channel disconnected while waiting for extension_ui_request"
+                    );
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+
+            assert!(
+                start.elapsed() <= Duration::from_secs(10),
+                "{label}: timed out waiting for extension_ui_request"
+            );
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(5)).await;
+        }
+    }
+
+    const RPC_BUSY_EXTENSION_COMMAND_EXT: &str = r#"
+export default function init(pi) {
+    pi.registerCommand("wait-confirm", {
+        description: "Block until RPC confirms",
+        handler: async () => {
+            const confirmed = await pi.ui.confirm("Wait", "Hold the command open");
+            return confirmed ? "confirmed" : "cancelled";
+        }
+    });
+}
+"#;
 
     #[test]
     fn line_count_from_newline_count_matches_trailing_newline_semantics() {
@@ -4536,6 +4745,79 @@ mod tests {
     #[test]
     fn is_extension_command_leading_whitespace() {
         assert!(is_extension_command("  /cmd", "  /cmd"));
+    }
+
+    #[test]
+    fn rpc_busy_extension_command_rejects_follow_on_extension_prompt_without_blocking() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let cwd = temp.path().to_path_buf();
+            let ext_entry_path = cwd.join("busy-ext.mjs");
+            std::fs::write(&ext_entry_path, RPC_BUSY_EXTENSION_COMMAND_EXT)
+                .expect("write extension source");
+
+            let mut agent_session = build_test_agent_session(Session::in_memory());
+            agent_session
+                .enable_extensions(&[], &cwd, None, &[ext_entry_path])
+                .await
+                .expect("enable extensions");
+
+            let options = build_test_rpc_options(&handle, cwd.join("auth.json"));
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+            let out_rx = Arc::new(Mutex::new(out_rx));
+
+            let server =
+                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+            let first = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"1","type":"prompt","message":"/wait-confirm"}"#,
+                "prompt(wait-confirm:first)",
+            )
+            .await;
+            assert_ok(&first, "prompt");
+
+            let ui_event = recv_ui_request(&out_rx, "wait-confirm ui").await;
+            assert_eq!(ui_event["method"], "confirm");
+            let request_id = ui_event["id"]
+                .as_str()
+                .expect("ui request id should be a string")
+                .to_string();
+
+            let second = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"2","type":"prompt","message":"/wait-confirm"}"#,
+                "prompt(wait-confirm:busy)",
+            )
+            .await;
+            assert_err(&second, "prompt");
+            assert_eq!(
+                second["error"],
+                "Extension commands are not allowed while agent is streaming"
+            );
+
+            let response = json!({
+                "id": "3",
+                "type": "extension_ui_response",
+                "requestId": request_id,
+                "confirmed": true,
+            })
+            .to_string();
+            let ui_resp = send_recv(&in_tx, &out_rx, &response, "wait-confirm response").await;
+            assert_ok(&ui_resp, "extension_ui_response");
+
+            drop(in_tx);
+            let result = server.await;
+            assert!(result.is_ok(), "rpc server error: {result:?}");
+        });
     }
 
     // -----------------------------------------------------------------------
