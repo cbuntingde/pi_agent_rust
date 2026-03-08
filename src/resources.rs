@@ -1680,15 +1680,9 @@ fn precedence_sorted_enabled_paths(resources: Vec<ResolvedResource>) -> Vec<Path
         .into_iter()
         .filter(|resource| resource.enabled)
         .collect::<Vec<_>>();
-    enabled.sort_by(|left, right| {
-        resource_path_precedence(left)
-            .cmp(&resource_path_precedence(right))
-            .then_with(|| {
-                left.path
-                    .to_string_lossy()
-                    .cmp(&right.path.to_string_lossy())
-            })
-    });
+    // Preserve source order within a precedence tier so CLI-specified
+    // extension/resource ordering remains behaviorally significant.
+    enabled.sort_by_key(resource_path_precedence);
     enabled.into_iter().map(|resource| resource.path).collect()
 }
 
@@ -2439,6 +2433,53 @@ still frontmatter",
                 PathBuf::from("/project/package/review.md"),
                 PathBuf::from("/global/package/review.md"),
             ]
+        );
+    }
+
+    #[test]
+    fn test_precedence_sorted_enabled_paths_preserves_source_order_within_same_precedence() {
+        let resources = vec![
+            ResolvedResource {
+                path: PathBuf::from("/tmp/cli-ext/zeta/review.md"),
+                enabled: true,
+                metadata: crate::package_manager::PathMetadata {
+                    source: "cli-extension:zeta".to_string(),
+                    scope: PackageScope::Temporary,
+                    origin: ResourceOrigin::Package,
+                    base_dir: None,
+                },
+            },
+            ResolvedResource {
+                path: PathBuf::from("/tmp/cli-ext/alpha/review.md"),
+                enabled: true,
+                metadata: crate::package_manager::PathMetadata {
+                    source: "cli-extension:alpha".to_string(),
+                    scope: PackageScope::Temporary,
+                    origin: ResourceOrigin::Package,
+                    base_dir: None,
+                },
+            },
+            ResolvedResource {
+                path: PathBuf::from("/project/.pi/prompts/review.md"),
+                enabled: true,
+                metadata: crate::package_manager::PathMetadata {
+                    source: "local:project".to_string(),
+                    scope: PackageScope::Project,
+                    origin: ResourceOrigin::TopLevel,
+                    base_dir: None,
+                },
+            },
+        ];
+
+        let sorted = precedence_sorted_enabled_paths(resources);
+        assert_eq!(
+            sorted,
+            vec![
+                PathBuf::from("/tmp/cli-ext/zeta/review.md"),
+                PathBuf::from("/tmp/cli-ext/alpha/review.md"),
+                PathBuf::from("/project/.pi/prompts/review.md"),
+            ],
+            "same-tier resources should keep their original source order"
         );
     }
 
