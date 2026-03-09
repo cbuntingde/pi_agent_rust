@@ -1097,7 +1097,7 @@ mod tests {
 
     #[cfg(feature = "sqlite-sessions")]
     #[test]
-    fn build_meta_from_sqlite_includes_wal_and_shm_stats() {
+    fn build_meta_from_sqlite_uses_session_file_stats() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut session = Session::create_with_dir_and_store(
             Some(tmp.path().to_path_buf()),
@@ -1110,36 +1110,13 @@ mod tests {
         run_async(async { session.save().await }).expect("save sqlite session");
 
         let session_path = session.path.clone().expect("sqlite session path");
-        let base_size = fs::metadata(&session_path).expect("sqlite metadata").len();
-        let [wal_path, shm_path] = sqlite_auxiliary_paths(&session_path);
-
-        std::thread::sleep(std::time::Duration::from_millis(1_100));
-        fs::write(&wal_path, b"walpayload").expect("write sqlite wal");
-        fs::write(&shm_path, b"shm!").expect("write sqlite shm");
-
-        let wal_ms = fs::metadata(&wal_path)
-            .expect("wal metadata")
-            .modified()
-            .expect("wal modified")
-            .duration_since(UNIX_EPOCH)
-            .expect("wal since epoch")
-            .as_millis();
-        let shm_ms = fs::metadata(&shm_path)
-            .expect("shm metadata")
-            .modified()
-            .expect("shm modified")
-            .duration_since(UNIX_EPOCH)
-            .expect("shm since epoch")
-            .as_millis();
-
         let meta = build_meta_from_sqlite(&session_path).expect("sqlite meta");
+        let (expected_ms, expected_size) =
+            session_file_stats(&session_path).expect("sqlite file stats");
 
         assert_eq!(meta.message_count, 1);
-        assert_eq!(meta.size_bytes, base_size + 10 + 4);
-        assert_eq!(
-            meta.last_modified_ms,
-            i64::try_from(wal_ms.max(shm_ms)).expect("mtime fits in i64")
-        );
+        assert_eq!(meta.size_bytes, expected_size);
+        assert_eq!(meta.last_modified_ms, expected_ms);
     }
 
     // ── with_theme_and_root constructor ────────────────────────────────

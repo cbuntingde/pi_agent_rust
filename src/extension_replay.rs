@@ -288,11 +288,11 @@ pub fn build_replay_diagnostic_snapshot(
 }
 
 fn compute_overhead_per_mille(baseline_micros: u64, captured_micros: u64) -> u32 {
-    if captured_micros <= baseline_micros {
-        return 0;
-    }
     if baseline_micros == 0 {
         return u32::MAX;
+    }
+    if captured_micros <= baseline_micros {
+        return 0;
     }
 
     let overhead = u128::from(captured_micros - baseline_micros);
@@ -1261,6 +1261,24 @@ mod tests {
         let observation = ReplayCaptureObservation {
             baseline_micros: 0,
             captured_micros: 1,
+            trace_bytes: 64,
+        };
+
+        let report = evaluate_replay_capture_gate(budget, observation);
+        assert!(!report.capture_allowed);
+        assert_eq!(
+            report.reason,
+            ReplayCaptureGateReason::DisabledByInvalidBaseline
+        );
+        assert_eq!(report.observed_overhead_per_mille, u32::MAX);
+    }
+
+    #[test]
+    fn capture_gate_fails_closed_when_zero_baseline_reports_zero_capture_cost() {
+        let budget = standard_capture_budget();
+        let observation = ReplayCaptureObservation {
+            baseline_micros: 0,
+            captured_micros: 0,
             trace_bytes: 64,
         };
 
