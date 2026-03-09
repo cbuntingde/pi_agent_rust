@@ -1559,9 +1559,6 @@ impl Session {
     #[allow(clippy::too_many_lines)]
     async fn save_inner(&mut self) -> Result<()> {
         self.ensure_entry_ids();
-        self.header
-            .validate()
-            .map_err(|reason| Error::session(format!("Invalid session header: {reason}")))?;
 
         let store_kind = match self
             .path
@@ -1622,6 +1619,16 @@ impl Session {
             let filename = format!("{}_{}.{}", timestamp, short_id, store_kind.extension());
             self.path = Some(project_session_dir.join(filename));
         }
+
+        // Persist a repaired id for legacy or manually corrupted in-memory headers.
+        // The filename fallback above still keeps empty ids on-disk-path-safe.
+        if self.header.id.trim().is_empty() {
+            self.header.id = uuid::Uuid::new_v4().to_string();
+            self.header_dirty = true;
+        }
+        self.header
+            .validate()
+            .map_err(|reason| Error::session(format!("Invalid session header: {reason}")))?;
 
         let session_dir_clone = self.session_dir.clone();
         let path = self.path.clone().unwrap();

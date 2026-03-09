@@ -5035,6 +5035,11 @@ impl AgentSession {
         };
 
         let (session_provider, session_model, session_thinking) = session_state;
+        let current_thinking = self
+            .agent
+            .stream_options()
+            .thinking_level
+            .unwrap_or_default();
 
         if let (Some(provider_id), Some(model_id)) =
             (session_provider.as_deref(), session_model.as_deref())
@@ -5042,14 +5047,16 @@ impl AgentSession {
             self.apply_session_model_selection(provider_id, model_id)?;
         }
 
-        let Some(session_thinking) = session_thinking.as_deref() else {
-            return Ok(());
-        };
-
-        let Ok(requested) = session_thinking.parse::<crate::model::ThinkingLevel>() else {
-            tracing::warn!("Ignoring invalid session thinking level: {session_thinking}");
-            return Ok(());
-        };
+        let parsed_session_thinking = session_thinking.as_deref().and_then(|raw| {
+            raw.parse::<crate::model::ThinkingLevel>().map_or_else(
+                |_| {
+                    tracing::warn!("Ignoring invalid session thinking level: {raw}");
+                    None
+                },
+                Some,
+            )
+        });
+        let requested = parsed_session_thinking.unwrap_or(current_thinking);
 
         let effective = if let (Some(provider_id), Some(model_id)) =
             (session_provider.as_deref(), session_model.as_deref())
@@ -5060,7 +5067,14 @@ impl AgentSession {
         };
 
         self.agent.stream_options_mut().thinking_level = Some(effective);
-        if effective == requested {
+
+        let thinking_changed = effective != current_thinking;
+        let persist_needed = if session_thinking.is_some() {
+            parsed_session_thinking != Some(effective)
+        } else {
+            thinking_changed
+        };
+        if !persist_needed {
             return Ok(());
         }
 
@@ -5077,7 +5091,7 @@ impl AgentSession {
                 .as_deref()
                 .and_then(|value| value.parse::<crate::model::ThinkingLevel>().ok());
             session.set_model_header(None, None, Some(effective.to_string()));
-            if previous_thinking != Some(effective) {
+            if thinking_changed && previous_thinking != Some(effective) {
                 session.append_thinking_level_change(effective.to_string());
             }
         }
@@ -7148,6 +7162,91 @@ mod tests {
                 session.header.provider = Some("acme".to_string());
                 session.header.model_id = Some("plain-model".to_string());
                 session.header.thinking_level = Some("high".to_string());
+            }
+
+            agent_session
+                .sync_runtime_selection_from_session_header()
+                .await
+                .expect("sync runtime selection");
+
+            assert_eq!(agent_session.agent.provider().name(), "acme");
+            assert_eq!(agent_session.agent.provider().model_id(), "plain-model");
+            assert_eq!(
+                agent_session.agent.stream_options().thinking_level,
+                Some(crate::model::ThinkingLevel::Off)
+            );
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let session = agent_session
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("session lock");
+            assert_eq!(session.header.thinking_level.as_deref(), Some("off"));
+            let thinking_changes = session
+                .entries_for_current_path()
+                .iter()
+                .filter(|entry| {
+                    matches!(entry, crate::session::SessionEntry::ThinkingLevelChange(_))
+                })
+                .count();
+            assert_eq!(thinking_changes, 1);
+        });
+    }
+
+    #[test]
+    fn sync_runtime_selection_from_session_header_clamps_current_thinking_when_header_omits_it() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let auth_path = dir.path().join("auth.json");
+            let auth = AuthStorage::load(auth_path).expect("load auth");
+
+            let mut registry = ModelRegistry::load(&auth, None);
+            registry.merge_entries(vec![ModelEntry {
+                model: Model {
+                    id: "plain-model".to_string(),
+                    name: "Plain Model".to_string(),
+                    api: "openai-completions".to_string(),
+                    provider: "acme".to_string(),
+                    base_url: "https://example.invalid/v1".to_string(),
+                    reasoning: false,
+                    input: vec![InputType::Text],
+                    cost: ModelCost {
+                        input: 0.0,
+                        output: 0.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                    },
+                    context_window: 128_000,
+                    max_tokens: 8_192,
+                    headers: HashMap::new(),
+                },
+                api_key: None,
+                headers: HashMap::new(),
+                auth_header: false,
+                compat: None,
+                oauth_config: None,
+            }]);
+
+            let mut agent_session = build_switch_test_session(&auth);
+            agent_session.set_model_registry(registry);
+            agent_session.agent.stream_options_mut().thinking_level =
+                Some(crate::model::ThinkingLevel::High);
+
+            {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut session = agent_session
+                    .session
+                    .lock(cx.cx())
+                    .await
+                    .expect("session lock");
+                session.header.provider = Some("acme".to_string());
+                session.header.model_id = Some("plain-model".to_string());
+                session.header.thinking_level = None;
             }
 
             agent_session

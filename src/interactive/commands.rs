@@ -751,7 +751,6 @@ impl PiApp {
                     )
                 }
             }
-            (None, None) => (self.model_entry.clone(), false),
             _ => (self.model_entry.clone(), false),
         };
 
@@ -769,7 +768,7 @@ impl PiApp {
                 && provider
                     .model_id()
                     .eq_ignore_ascii_case(&target_entry.model.id);
-        if sync_model && !runtime_matches_target {
+        if !runtime_matches_target {
             let resolved_key_opt = resolve_model_key_from_default_auth(&target_entry);
             if model_requires_configured_credential(&target_entry) && resolved_key_opt.is_none() {
                 return Err(format!(
