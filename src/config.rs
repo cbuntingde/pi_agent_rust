@@ -1289,24 +1289,6 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
-    struct CurrentDirGuard {
-        original: PathBuf,
-    }
-
-    impl CurrentDirGuard {
-        fn set(path: &std::path::Path) -> Self {
-            let original = std::env::current_dir().expect("read current dir");
-            std::env::set_current_dir(path).expect("set current dir");
-            Self { original }
-        }
-    }
-
-    impl Drop for CurrentDirGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.original);
-        }
-    }
-
     fn write_file(path: &std::path::Path, contents: &str) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("create parent dir");
@@ -1373,7 +1355,6 @@ mod tests {
         let temp = TempDir::new().expect("create tempdir");
         let unrelated = temp.path().join("unrelated");
         std::fs::create_dir_all(&unrelated).expect("create unrelated dir");
-        let _guard = CurrentDirGuard::set(&unrelated);
 
         let cwd = temp.path().join("cwd");
         let global_dir = temp.path().join("global");

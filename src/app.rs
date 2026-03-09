@@ -1458,7 +1458,7 @@ mod tests {
         let mut session = Session::in_memory();
         session.append_model_change("missing-provider".to_string(), "missing-model".to_string());
 
-        let mut setup_default = test_model_entry("gpt-5.4", "openai", true);
+        let mut setup_default = test_model_entry("gpt-5.4", "openai-codex", true);
         setup_default.api_key = None;
         setup_default.auth_header = true;
 
@@ -1467,12 +1467,12 @@ mod tests {
             select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
                 .expect("selection should fall back to a stable setup model");
 
-        assert_eq!(selection.model_entry.model.provider, "openai");
+        assert_eq!(selection.model_entry.model.provider, "openai-codex");
         assert_eq!(selection.model_entry.model.id, "gpt-5.4");
         assert_eq!(
             selection.fallback_message.as_deref(),
             Some(
-                "Could not restore model missing-provider/missing-model (model no longer exists). Defaulting to openai/gpt-5.4 for setup."
+                "Could not restore model missing-provider/missing-model (model no longer exists). Defaulting to openai-codex/gpt-5.4 for setup."
             )
         );
     }
@@ -1481,24 +1481,24 @@ mod tests {
     fn select_model_and_thinking_preserves_restore_warning_when_using_config_default() {
         let cli = cli::Cli::parse_from(["pi"]);
         let config = Config {
-            default_provider: Some("openai".to_string()),
+            default_provider: Some("openai-codex".to_string()),
             default_model: Some("gpt-4o-mini".to_string()),
             ..Config::default()
         };
         let mut session = Session::in_memory();
         session.append_model_change("missing-provider".to_string(), "missing-model".to_string());
 
-        let registry = registry_with_entries(vec![test_model_entry("gpt-4o-mini", "openai", true)]);
+        let registry = registry_with_entries(vec![test_model_entry("gpt-4o-mini", "openai-codex", true)]);
         let selection =
             select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
                 .expect("selection should use the configured default model");
 
-        assert_eq!(selection.model_entry.model.provider, "openai");
+        assert_eq!(selection.model_entry.model.provider, "openai-codex");
         assert_eq!(selection.model_entry.model.id, "gpt-4o-mini");
         assert_eq!(
             selection.fallback_message.as_deref(),
             Some(
-                "Could not restore model missing-provider/missing-model (model no longer exists). Using openai/gpt-4o-mini."
+                "Could not restore model missing-provider/missing-model (model no longer exists). Using openai-codex/gpt-4o-mini."
             )
         );
     }
