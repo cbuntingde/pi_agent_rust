@@ -1106,7 +1106,9 @@ pub fn normalize_openai_base(base_url: &str) -> String {
     if base_url.ends_with("/chat/completions") {
         return base_url;
     }
-    let base_url = base_url.strip_suffix("/responses").unwrap_or(&base_url);
+    let base_url = base_url
+        .strip_suffix("/responses")
+        .unwrap_or(base_url.as_str());
     format!("{base_url}/chat/completions")
 }
 
@@ -1139,7 +1141,7 @@ pub fn normalize_openai_responses_base(base_url: &str) -> String {
     }
     let base_url = base_url
         .strip_suffix("/chat/completions")
-        .unwrap_or(&base_url);
+        .unwrap_or(base_url.as_str());
     format!("{base_url}/responses")
 }
 
