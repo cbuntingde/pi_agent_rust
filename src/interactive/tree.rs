@@ -413,7 +413,7 @@ impl PiApp {
             let new_session_id = new_session.header.id.clone();
 
             if let Err(err) = new_session.save().await {
-                let _ = event_tx.try_send(PiMsg::AgentError(format!("Failed to save fork: {err}")));
+                let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::AgentError(format!("Failed to save fork: {err}"))).await;
                 return;
             }
 
@@ -454,13 +454,13 @@ impl PiApp {
                 conversation_from_session(&guard)
             };
 
-            let _ = event_tx.try_send(PiMsg::ConversationReset {
+            let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::ConversationReset {
                 messages,
                 usage,
                 status: Some(format!("Forked new session from {}", selection.summary)),
-            });
+            }).await;
 
-            let _ = event_tx.try_send(PiMsg::SetEditorText(selected_text));
+            let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::SetEditorText(selected_text)).await;
 
             if let Some(manager) = extensions {
                 let _ = manager

@@ -1637,11 +1637,11 @@ pub async fn run_interactive(
     Ok(())
 }
 
-async fn enqueue_pi_event(event_tx: &mpsc::Sender<PiMsg>, cx: &Cx, msg: PiMsg) -> bool {
+pub(crate) async fn enqueue_pi_event(event_tx: &mpsc::Sender<PiMsg>, cx: &Cx, msg: PiMsg) -> bool {
     event_tx.send(cx, msg).await.is_ok()
 }
 
-async fn enqueue_ui_shutdown(event_tx: &mpsc::Sender<PiMsg>, cx: &Cx) {
+pub(crate) async fn enqueue_ui_shutdown(event_tx: &mpsc::Sender<PiMsg>, cx: &Cx) {
     let _ = enqueue_pi_event(event_tx, cx, PiMsg::UiShutdown).await;
 }
 

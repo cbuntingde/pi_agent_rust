@@ -304,8 +304,10 @@ async fn write_all_with_retry<W: AsyncWrite + Unpin>(
             );
 
             // Flushing the writer is crucial when TLS buffers are full, otherwise
-            // we will sleep and retry without any progress being made.
-            let _ = futures::future::poll_fn(|cx| Pin::new(&mut *writer).poll_flush(cx)).await;
+            // we will sleep and retry without any progress being made. If flush
+            // itself fails, surface that real transport error immediately rather
+            // than misreporting the retry loop as a generic write-zero failure.
+            futures::future::poll_fn(|cx| Pin::new(&mut *writer).poll_flush(cx)).await?;
 
             let now = asupersync::Cx::current()
                 .and_then(|cx| cx.timer_driver())
@@ -1014,6 +1016,7 @@ impl AsyncWrite for Transport {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::VecDeque;
 
     // ── Method ──────────────────────────────────────────────────────────
     #[test]
@@ -1553,6 +1556,83 @@ mod tests {
         let client = Client::new();
         let builder = client.get("https://api.example.com").no_timeout();
         assert_eq!(builder.timeout, None);
+    }
+
+    struct MockRetryWriter {
+        writes: VecDeque<std::io::Result<usize>>,
+        flushes: VecDeque<std::io::Result<()>>,
+        written: Vec<u8>,
+    }
+
+    impl MockRetryWriter {
+        fn new(
+            writes: impl IntoIterator<Item = std::io::Result<usize>>,
+            flushes: impl IntoIterator<Item = std::io::Result<()>>,
+        ) -> Self {
+            Self {
+                writes: writes.into_iter().collect(),
+                flushes: flushes.into_iter().collect(),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl AsyncWrite for MockRetryWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let result = self.writes.pop_front().unwrap_or(Ok(buf.len()));
+            if let Ok(written) = result {
+                self.written
+                    .extend_from_slice(&buf[..written.min(buf.len())]);
+            }
+            Poll::Ready(result)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(self.flushes.pop_front().unwrap_or(Ok(())))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn write_all_with_retry_propagates_flush_error_after_zero_write() {
+        asupersync::test_utils::run_test(|| async {
+            let mut writer = MockRetryWriter::new(
+                [Ok(0)],
+                [Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "flush failed",
+                ))],
+            );
+
+            let err = write_all_with_retry(&mut writer, b"hello")
+                .await
+                .expect_err("flush failure should not be swallowed");
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+            assert_eq!(err.to_string(), "flush failed");
+            assert!(writer.written.is_empty());
+        });
+    }
+
+    #[test]
+    fn write_all_with_retry_recovers_after_zero_write_when_flush_succeeds() {
+        asupersync::test_utils::run_test(|| async {
+            let mut writer = MockRetryWriter::new([Ok(0), Ok(2), Ok(3)], [Ok(())]);
+
+            write_all_with_retry(&mut writer, b"hello")
+                .await
+                .expect("retry helper should recover after transient zero write");
+            assert_eq!(writer.written, b"hello");
+        });
     }
 
     // ── Response ───────────────────────────────────────────────────────

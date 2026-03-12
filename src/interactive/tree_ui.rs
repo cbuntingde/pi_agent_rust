@@ -406,9 +406,9 @@ impl PiApp {
                     .await
                     .unwrap_or(false);
                 if cancelled {
-                    let _ = event_tx.try_send(PiMsg::System(
+                    let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::System(
                         "Session switch cancelled by extension".to_string(),
-                    ));
+                    )).await;
                     return;
                 }
             }
@@ -450,9 +450,9 @@ impl PiApp {
 
                 if let Some(target_id) = &pending.new_leaf_id {
                     if !guard.navigate_to(target_id) {
-                        let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::AgentError(format!(
                             "Branch target not found: {target_id}"
-                        )));
+                        ))).await;
                         return;
                     }
                 } else {
@@ -504,14 +504,14 @@ impl PiApp {
                 Some(format!("Switched to {to_id_for_event}"))
             };
 
-            let _ = event_tx.try_send(PiMsg::ConversationReset {
+            let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::ConversationReset {
                 messages,
                 usage,
                 status,
-            });
+            }).await;
 
             if let Some(text) = pending.editor_text {
-                let _ = event_tx.try_send(PiMsg::SetEditorText(text));
+                let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::SetEditorText(text)).await;
             }
 
             if let Some(manager) = extensions {

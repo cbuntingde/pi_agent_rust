@@ -466,9 +466,9 @@ impl PiApp {
                     .unwrap_or(false);
                 if cancelled {
                     is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-                    let _ = event_tx.try_send(PiMsg::System(
+                    let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::System(
                         "Compaction cancelled by extension".to_string(),
-                    ));
+                    )).await;
                     return;
                 }
             }
@@ -481,9 +481,9 @@ impl PiApp {
             };
             let Some(prep) = crate::compaction::prepare_compaction(&path_entries, settings) else {
                 is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-                let _ = event_tx.try_send(PiMsg::System(
+                let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::System(
                     "Nothing to compact (already compacted or too little history)".to_string(),
-                ));
+                )).await;
                 return;
             };
 
@@ -555,11 +555,11 @@ impl PiApp {
             };
 
             is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-            let _ = event_tx.try_send(PiMsg::ConversationReset {
+            let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request), PiMsg::ConversationReset {
                 messages,
                 usage,
                 status: Some("Compaction complete".to_string()),
-            });
+            }).await;
 
             if let Some(manager) = extensions {
                 let _ = manager
