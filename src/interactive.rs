@@ -1048,14 +1048,21 @@ impl PiApp {
             let mut session_guard = match session.lock(&task_cx).await {
                 Ok(guard) => guard,
                 Err(err) => {
-                    let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(format!("Failed to lock session: {err}"))).await;
+                    let _ = crate::interactive::enqueue_pi_event_current(
+                        &event_tx,
+                        PiMsg::AgentError(format!("Failed to lock session: {err}")),
+                    )
+                    .await;
                     return;
                 }
             };
 
             if let Err(err) = session_guard.save().await {
-                let _ =
-                    event_tx.try_send(PiMsg::AgentError(format!("Failed to save session: {err}")));
+                let _ = crate::interactive::enqueue_pi_event_current(
+                    &event_tx,
+                    PiMsg::AgentError(format!("Failed to save session: {err}")),
+                )
+                .await;
             }
         });
     }
@@ -1435,9 +1442,11 @@ impl PiApp {
                     .await
                     .unwrap_or(false);
                 if cancelled {
-                    let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::System(
-                        "Session switch cancelled by extension".to_string(),
-                    )).await;
+                    let _ = crate::interactive::enqueue_pi_event_current(
+                        &event_tx,
+                        PiMsg::System("Session switch cancelled by extension".to_string()),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -1445,7 +1454,11 @@ impl PiApp {
             let mut loaded_session = match Session::open(&path).await {
                 Ok(session) => session,
                 Err(err) => {
-                    let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(format!("Failed to open session: {err}"))).await;
+                    let _ = crate::interactive::enqueue_pi_event_current(
+                        &event_tx,
+                        PiMsg::AgentError(format!("Failed to open session: {err}")),
+                    )
+                    .await;
                     return;
                 }
             };
@@ -1459,7 +1472,11 @@ impl PiApp {
                 let mut session_guard = match session.lock(&task_cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(format!("Failed to lock session: {err}"))).await;
+                        let _ = crate::interactive::enqueue_pi_event_current(
+                            &event_tx,
+                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -1471,7 +1488,11 @@ impl PiApp {
                 let mut agent_guard = match agent.lock(&task_cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(format!("Failed to lock agent: {err}"))).await;
+                        let _ = crate::interactive::enqueue_pi_event_current(
+                            &event_tx,
+                            PiMsg::AgentError(format!("Failed to lock agent: {err}")),
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -1482,18 +1503,26 @@ impl PiApp {
                 let session_guard = match session.lock(&task_cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::AgentError(format!("Failed to lock session: {err}"))).await;
+                        let _ = crate::interactive::enqueue_pi_event_current(
+                            &event_tx,
+                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
+                        )
+                        .await;
                         return;
                     }
                 };
                 conversation_from_session(&session_guard)
             };
 
-            let _ = crate::interactive::enqueue_pi_event(&event_tx, &asupersync::Cx::for_request(), PiMsg::ConversationReset {
-                messages,
-                usage,
-                status: Some("Session resumed".to_string()),
-            }).await;
+            let _ = crate::interactive::enqueue_pi_event_current(
+                &event_tx,
+                PiMsg::ConversationReset {
+                    messages,
+                    usage,
+                    status: Some("Session resumed".to_string()),
+                },
+            )
+            .await;
 
             if let Some(manager) = extensions {
                 let _ = manager
@@ -1634,6 +1663,11 @@ pub async fn run_interactive(
 
 pub(crate) async fn enqueue_pi_event(event_tx: &mpsc::Sender<PiMsg>, cx: &Cx, msg: PiMsg) -> bool {
     event_tx.send(cx, msg).await.is_ok()
+}
+
+pub(crate) async fn enqueue_pi_event_current(event_tx: &mpsc::Sender<PiMsg>, msg: PiMsg) -> bool {
+    let cx = Cx::current().unwrap_or_else(Cx::for_request);
+    enqueue_pi_event(event_tx, &cx, msg).await
 }
 
 pub(crate) async fn enqueue_ui_shutdown(event_tx: &mpsc::Sender<PiMsg>, cx: &Cx) {
