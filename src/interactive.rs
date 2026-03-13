@@ -610,6 +610,9 @@ impl PiApp {
         if let Ok(mut queue) = self.message_queue.lock() {
             queue.set_modes(steering_mode, follow_up_mode);
         }
+        if let Ok(mut queue) = self.injected_queue.lock() {
+            queue.set_modes(steering_mode, follow_up_mode);
+        }
 
         if let Ok(mut agent_guard) = self.agent.try_lock() {
             agent_guard.set_queue_modes(steering_mode, follow_up_mode);
@@ -1845,6 +1848,7 @@ pub struct PiApp {
     input_mode: InputMode,
     pending_inputs: VecDeque<PendingInput>,
     message_queue: Arc<StdMutex<InteractiveMessageQueue>>,
+    injected_queue: Arc<StdMutex<InjectedMessageQueue>>,
 
     // Display state - viewport for scrollable conversation
     pub conversation_viewport: Viewport,
@@ -2130,6 +2134,7 @@ impl PiApp {
             input_mode: InputMode::SingleLine,
             pending_inputs: VecDeque::from(pending_inputs),
             message_queue,
+            injected_queue: Arc::clone(&injected_queue),
             conversation_viewport,
             follow_stream_tail: true,
             spinner,

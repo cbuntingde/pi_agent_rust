@@ -1,6 +1,110 @@
 use super::share::{parse_gist_url_and_id, parse_share_is_public, share_gist_description};
 use super::*;
+use crate::agent::AgentConfig;
+use crate::model::StreamEvent;
+use crate::provider::{Context, Provider, StreamOptions};
+use crate::resources::{ResourceCliOptions, ResourceLoader};
+use crate::session::Session;
+use crate::tools::ToolRegistry;
+use asupersync::channel::mpsc;
+use asupersync::runtime::RuntimeBuilder;
+use futures::stream;
 use serde_json::json;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::OnceLock;
+
+struct DummyProvider;
+
+#[async_trait::async_trait]
+impl Provider for DummyProvider {
+    fn name(&self) -> &'static str {
+        "dummy"
+    }
+
+    fn api(&self) -> &'static str {
+        "dummy"
+    }
+
+    fn model_id(&self) -> &'static str {
+        "dummy-model"
+    }
+
+    async fn stream(
+        &self,
+        _context: &Context<'_>,
+        _options: &StreamOptions,
+    ) -> crate::error::Result<
+        Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+    > {
+        Ok(Box::pin(stream::empty()))
+    }
+}
+
+fn test_runtime_handle() -> asupersync::runtime::RuntimeHandle {
+    static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("build asupersync runtime")
+    })
+    .handle()
+}
+
+fn build_test_app_with_config(config: Config) -> PiApp {
+    let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
+    let agent = Agent::new(
+        provider,
+        ToolRegistry::new(&[], Path::new("."), Some(&config)),
+        AgentConfig::default(),
+    );
+    let resources = ResourceLoader::empty(config.enable_skill_commands());
+    let resource_cli = ResourceCliOptions {
+        no_skills: false,
+        no_prompt_templates: false,
+        no_extensions: false,
+        no_themes: false,
+        skill_paths: Vec::new(),
+        prompt_paths: Vec::new(),
+        extension_paths: Vec::new(),
+        theme_paths: Vec::new(),
+    };
+    let model_entry = test_model_entry("dummy", "dummy-model");
+    let model_scope = vec![model_entry.clone()];
+    let available_models = vec![model_entry.clone()];
+    let (event_tx, _event_rx) = mpsc::channel(64);
+
+    PiApp::new(
+        agent,
+        Arc::new(asupersync::sync::Mutex::new(Session::in_memory())),
+        config,
+        resources,
+        resource_cli,
+        Path::new(".").to_path_buf(),
+        model_entry,
+        model_scope,
+        available_models,
+        Vec::new(),
+        event_tx,
+        test_runtime_handle(),
+        false,
+        None,
+        Some(KeyBindings::new()),
+        Vec::new(),
+        Usage::default(),
+    )
+}
+
+fn custom_test_message(content: &str) -> ModelMessage {
+    ModelMessage::Custom(CustomMessage {
+        content: content.to_string(),
+        custom_type: "test".to_string(),
+        display: false,
+        details: None,
+        timestamp: 0,
+    })
+}
 
 #[test]
 fn format_count_suffixes() {
@@ -682,6 +786,28 @@ fn parse_queue_mode_default() {
         parse_queue_mode_or_default(Some("anything")),
         QueueMode::OneAtATime
     ));
+}
+
+#[test]
+fn apply_queue_modes_updates_injected_queue_delivery_policy() {
+    let app = build_test_app_with_config(Config {
+        steering_mode: Some("one-at-a-time".to_string()),
+        follow_up_mode: Some("one-at-a-time".to_string()),
+        ..Config::default()
+    });
+    app.apply_queue_modes(QueueMode::All, QueueMode::All);
+
+    let queued_follow_ups = {
+        let mut queue = app.injected_queue.lock().expect("lock injected queue");
+        queue.push_follow_up(custom_test_message("first"));
+        queue.push_follow_up(custom_test_message("second"));
+        queue.pop_follow_up().len()
+    };
+
+    assert_eq!(
+        queued_follow_ups, 2,
+        "updated queue modes should apply to extension-injected messages too"
+    );
 }
 
 // --- push_line tests ---

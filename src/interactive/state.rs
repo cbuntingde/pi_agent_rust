@@ -766,6 +766,11 @@ impl InjectedMessageQueue {
         }
     }
 
+    pub(super) const fn set_modes(&mut self, steering_mode: QueueMode, follow_up_mode: QueueMode) {
+        self.steering_mode = steering_mode;
+        self.follow_up_mode = follow_up_mode;
+    }
+
     fn push_kind(&mut self, kind: QueuedMessageKind, message: ModelMessage) {
         match kind {
             QueuedMessageKind::Steering => self.steering.push_back(message),
