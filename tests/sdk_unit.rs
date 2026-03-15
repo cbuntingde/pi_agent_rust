@@ -229,8 +229,10 @@ fn transport_session_transport_state_variants() {
         session_id: "s2".to_string(),
         session_name: None,
         auto_compaction_enabled: true,
+        auto_retry_enabled: false,
         message_count: 0,
         pending_message_count: 0,
+        durability_mode: "balanced".to_string(),
     }));
 
     // Debug and Clone
@@ -1004,7 +1006,9 @@ fn rpc_session_state_defaults_serde() {
     assert_eq!(result.thinking_level, "");
     assert!(!result.is_streaming);
     assert!(!result.is_compacting);
+    assert!(!result.auto_retry_enabled);
     assert_eq!(result.message_count, 0);
+    assert_eq!(result.durability_mode, "");
 
     harness
         .log()

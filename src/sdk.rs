@@ -429,9 +429,13 @@ pub struct RpcSessionState {
     #[serde(default)]
     pub auto_compaction_enabled: bool,
     #[serde(default)]
+    pub auto_retry_enabled: bool,
+    #[serde(default)]
     pub message_count: usize,
     #[serde(default)]
     pub pending_message_count: usize,
+    #[serde(default)]
+    pub durability_mode: String,
 }
 
 /// Session-level token aggregates returned by RPC `get_session_stats`.

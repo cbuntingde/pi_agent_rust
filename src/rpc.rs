@@ -3773,6 +3773,10 @@ fn session_state(
         Value::Bool(snapshot.auto_compaction_enabled),
     );
     state.insert(
+        "autoRetryEnabled".to_string(),
+        Value::Bool(snapshot.auto_retry_enabled),
+    );
+    state.insert(
         "messageCount".to_string(),
         Value::Number(message_count.into()),
     );
