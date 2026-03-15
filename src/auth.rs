@@ -3174,6 +3174,7 @@ pub async fn complete_copilot_browser_oauth(
     config: &CopilotOAuthConfig,
     code_input: &str,
     verifier: &str,
+    redirect_uri: Option<&str>,
 ) -> Result<AuthCredential> {
     let (code, state) = parse_oauth_code_input(code_input);
 
@@ -3199,16 +3200,22 @@ pub async fn complete_copilot_browser_oauth(
     };
 
     let client = crate::http::client::Client::new();
+    let mut body = serde_json::json!({
+        "grant_type": "authorization_code",
+        "client_id": config.client_id,
+        "code": code,
+        "state": state,
+        "code_verifier": verifier,
+    });
+    // RFC 6749 §4.1.3: redirect_uri MUST be included in the token request
+    // if it was included in the authorization request.
+    if let Some(uri) = redirect_uri {
+        body["redirect_uri"] = serde_json::Value::String(uri.to_string());
+    }
     let request = client
         .post(&token_url_str)
         .header("Accept", "application/json")
-        .json(&serde_json::json!({
-            "grant_type": "authorization_code",
-            "client_id": config.client_id,
-            "code": code,
-            "state": state,
-            "code_verifier": verifier,
-        }))?;
+        .json(&body)?;
 
     let response = Box::pin(request.send())
         .await
@@ -4367,7 +4374,7 @@ mod tests {
         let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
         rt.expect("runtime").block_on(async {
             let config = CopilotOAuthConfig::default();
-            let err = complete_copilot_browser_oauth(&config, "abc#mismatch", "expected")
+            let err = complete_copilot_browser_oauth(&config, "abc#mismatch", "expected", None)
                 .await
                 .unwrap_err();
             assert!(err.to_string().contains("State mismatch"));

@@ -875,6 +875,7 @@ impl PiApp {
             verifier,
             oauth_config,
             device_code,
+            redirect_uri,
         } = pending;
         let code_input = code_input.to_string();
 
@@ -935,6 +936,7 @@ impl PiApp {
                             &copilot_config,
                             &code_input,
                             &verifier,
+                            redirect_uri.as_deref(),
                         ))
                         .await
                     } else if provider == "gitlab" || provider == "gitlab-duo" {
@@ -1840,6 +1842,7 @@ impl PiApp {
                 verifier: String::new(),
                 oauth_config: None,
                 device_code: None,
+                redirect_uri: None,
             });
             self.input_mode = InputMode::SingleLine;
             self.set_input_height(3);
@@ -1877,6 +1880,7 @@ After approving access in the browser, press Enter in Pi to complete login.",
                         verifier: String::new(),
                         oauth_config: None,
                         device_code: Some(device.device_code),
+                        redirect_uri: None,
                     });
                     self.input_mode = InputMode::SingleLine;
                     self.set_input_height(3);
@@ -2003,6 +2007,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                     verifier: info.verifier,
                     oauth_config: ext_config,
                     device_code: None,
+                    redirect_uri: info.redirect_uri,
                 });
                 self.input_mode = InputMode::SingleLine;
                 self.set_input_height(3);

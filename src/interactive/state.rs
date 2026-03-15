@@ -33,6 +33,8 @@ pub(super) struct PendingOAuth {
     pub(super) oauth_config: Option<OAuthConfig>,
     /// Device code for RFC 8628 device flow providers.
     pub(super) device_code: Option<String>,
+    /// The redirect URI used in the authorization request (needed for token exchange per RFC 6749 §4.1.3).
+    pub(super) redirect_uri: Option<String>,
 }
 
 /// Tool output line count above which blocks auto-collapse.
