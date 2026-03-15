@@ -371,10 +371,10 @@ pub fn list_sessions_for_project(cwd: &Path, override_dir: Option<&Path>) -> Vec
     let mut by_path = HashMap::new();
     for meta in sessions {
         let path = PathBuf::from(&meta.path);
-        if path.exists() {
-            by_path.insert(meta.path.clone(), meta);
-        } else {
+        if indexed_session_path_is_missing(&path) {
             missing_paths.push(path);
+        } else {
+            by_path.insert(meta.path.clone(), meta);
         }
     }
 
@@ -397,6 +397,20 @@ pub fn list_sessions_for_project(cwd: &Path, override_dir: Option<&Path>) -> Vec
     sessions.sort_by_key(|m| Reverse(m.last_modified_ms));
     sessions.truncate(50);
     sessions
+}
+
+fn indexed_session_path_is_missing(path: &Path) -> bool {
+    match path.try_exists() {
+        Ok(exists) => !exists,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "Failed to determine whether indexed session path exists; deferring prune"
+            );
+            false
+        }
+    }
 }
 
 struct ScanSessionsResult {
@@ -1364,6 +1378,61 @@ mod tests {
             .list_sessions(Some(&cwd.display().to_string()))
             .expect("list sessions");
         assert!(indexed.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_sessions_for_project_keeps_permission_denied_row_indexed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base_dir = tmp.path().join("sessions");
+        let cwd = tmp.path().join("repo");
+        let project_dir = base_dir.join(encode_cwd(&cwd));
+        fs::create_dir_all(&project_dir).expect("create project sessions");
+
+        let session_path = project_dir.join("guarded.jsonl");
+        let mut header = SessionHeader::new();
+        header.id = "guarded-session".to_string();
+        header.cwd = cwd.display().to_string();
+        header.timestamp = "2025-06-01T12:00:00.000Z".to_string();
+        fs::write(
+            &session_path,
+            format!(
+                "{}\n{{\"type\":\"message\"}}\n",
+                serde_json::to_string(&header).expect("serialize header"),
+            ),
+        )
+        .expect("write session");
+
+        let index = SessionIndex::for_sessions_root(&base_dir);
+        index.reindex_all().expect("seed session index");
+
+        let original_mode = fs::metadata(&project_dir)
+            .expect("project dir metadata")
+            .permissions()
+            .mode();
+        fs::set_permissions(&project_dir, fs::Permissions::from_mode(0o000))
+            .expect("chmod project dir");
+
+        assert!(
+            session_path.try_exists().is_err(),
+            "expected permission-denied path probe for inaccessible project session directory"
+        );
+
+        let sessions = list_sessions_for_project(&cwd, Some(&base_dir));
+
+        fs::set_permissions(&project_dir, fs::Permissions::from_mode(original_mode))
+            .expect("restore project dir permissions");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].path, session_path.display().to_string());
+
+        let indexed = index
+            .list_sessions(Some(&cwd.display().to_string()))
+            .expect("list indexed sessions");
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].path, session_path.display().to_string());
     }
 
     #[cfg(feature = "sqlite-sessions")]
