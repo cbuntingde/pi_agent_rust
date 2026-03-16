@@ -152,12 +152,6 @@ fn build_prompt_content_blocks(text: &str, images: &[ImageContent]) -> Vec<Conte
     blocks
 }
 
-fn is_extension_command(message: &str, expanded: &str) -> bool {
-    // Extension commands start with `/` but are not expanded by the resource loader
-    // (skills and prompt templates are expanded before queueing/sending).
-    message.trim_start().starts_with('/') && message == expanded
-}
-
 fn parse_extension_command_line(message: &str) -> Option<(String, String)> {
     let trimmed = message.trim_start();
     let stripped = trimmed.strip_prefix('/')?;
@@ -173,10 +167,9 @@ fn parse_extension_command_line(message: &str) -> Option<(String, String)> {
 
 fn resolve_extension_command(
     message: &str,
-    expanded: &str,
     manager: Option<&ExtensionManager>,
 ) -> Option<(String, String)> {
-    if !is_extension_command(message, expanded) {
+    if !message.trim_start().starts_with('/') {
         return None;
     }
 
@@ -578,9 +571,8 @@ pub async fn run(
                         }
                     };
 
-                let expanded = options.resources.expand_input(&message);
                 let extension_command =
-                    resolve_extension_command(&message, &expanded, rpc_extension_manager.as_ref());
+                    resolve_extension_command(&message, rpc_extension_manager.as_ref());
 
                 if is_streaming.load(Ordering::SeqCst) {
                     if extension_command.is_some() {
@@ -604,6 +596,7 @@ pub async fn run(
                         continue;
                     }
 
+                    let expanded = options.resources.expand_input(&message);
                     let queued_result = {
                         let mut state = shared_state
                             .lock(&cx)
@@ -664,7 +657,7 @@ pub async fn run(
                 } else {
                     let retry_abort = retry_abort.clone();
                     let options = options.clone();
-                    let expanded = expanded.clone();
+                    let expanded = options.resources.expand_input(&message);
                     let prompt_cx = cx.clone();
                     runtime_handle.spawn(async move {
                         let _current = asupersync::Cx::set_current(Some(prompt_cx.cx().clone()));
@@ -697,8 +690,7 @@ pub async fn run(
                     continue;
                 };
 
-                let expanded = options.resources.expand_input(&message);
-                if is_extension_command(&message, &expanded) {
+                if resolve_extension_command(&message, rpc_extension_manager.as_ref()).is_some() {
                     let resp = response_error(
                         id,
                         "steer",
@@ -708,6 +700,7 @@ pub async fn run(
                     continue;
                 }
 
+                let expanded = options.resources.expand_input(&message);
                 if is_streaming.load(Ordering::SeqCst) {
                     let result = shared_state
                         .lock(&cx)
@@ -771,8 +764,7 @@ pub async fn run(
                     continue;
                 };
 
-                let expanded = options.resources.expand_input(&message);
-                if is_extension_command(&message, &expanded) {
+                if resolve_extension_command(&message, rpc_extension_manager.as_ref()).is_some() {
                     let resp = response_error(
                         id,
                         "follow_up",
@@ -782,6 +774,7 @@ pub async fn run(
                     continue;
                 }
 
+                let expanded = options.resources.expand_input(&message);
                 if is_streaming.load(Ordering::SeqCst) {
                     let result = shared_state
                         .lock(&cx)
@@ -4737,8 +4730,9 @@ mod tests {
         AssistantMessage, ContentBlock, ImageContent, StopReason, TextContent, ThinkingLevel,
         Usage, UserContent, UserMessage,
     };
+    use crate::package_manager::PackageManager;
     use crate::provider::{InputType, Model, ModelCost, Provider};
-    use crate::resources::ResourceLoader;
+    use crate::resources::{ResourceCliOptions, ResourceLoader};
     use crate::session::Session;
     use crate::tools::ToolRegistry;
     use async_trait::async_trait;
@@ -4969,6 +4963,57 @@ mod tests {
             auth,
             runtime_handle: handle.clone(),
         }
+    }
+
+    async fn load_test_prompt_template_resources(
+        cwd: &Path,
+        template_name: &str,
+        content: &str,
+    ) -> ResourceLoader {
+        let prompt_path = cwd.join(format!("{template_name}.md"));
+        std::fs::write(&prompt_path, content).expect("write prompt template");
+
+        let manager = PackageManager::new(cwd.to_path_buf());
+        let config = crate::config::Config::default();
+        let cli = ResourceCliOptions {
+            no_skills: true,
+            no_prompt_templates: false,
+            no_extensions: true,
+            no_themes: true,
+            skill_paths: Vec::new(),
+            prompt_paths: vec![prompt_path.to_string_lossy().to_string()],
+            extension_paths: Vec::new(),
+            theme_paths: Vec::new(),
+        };
+
+        ResourceLoader::load(&manager, cwd, &config, &cli)
+            .await
+            .expect("load prompt template resources")
+    }
+
+    async fn build_queue_state_rpc_fixture(
+        handle: &asupersync::runtime::RuntimeHandle,
+        cwd: &Path,
+    ) -> (AgentSession, RpcOptions) {
+        let ext_entry_path = cwd.join("queue-state-ext.mjs");
+        std::fs::write(&ext_entry_path, RPC_QUEUE_STATE_EXTENSION_EXT)
+            .expect("write extension source");
+
+        let mut agent_session = build_test_agent_session(Session::in_memory());
+        agent_session
+            .enable_extensions(&[], cwd, None, &[ext_entry_path])
+            .await
+            .expect("enable extensions");
+
+        let mut options = build_test_rpc_options(handle, cwd.join("auth.json"));
+        options.resources = load_test_prompt_template_resources(
+            cwd,
+            "report-queue-state",
+            "Prompt template shadow that should not win.\n",
+        )
+        .await;
+
+        (agent_session, options)
     }
 
     async fn recv_line(
@@ -5438,31 +5483,41 @@ export default function init(pi) {
     }
 
     // -----------------------------------------------------------------------
-    // is_extension_command
+    // parse_extension_command_line
     // -----------------------------------------------------------------------
 
     #[test]
-    fn is_extension_command_slash_unchanged() {
-        assert!(is_extension_command("/mycommand", "/mycommand"));
+    fn parse_extension_command_line_parses_simple_command() {
+        assert_eq!(
+            parse_extension_command_line("/mycommand"),
+            Some(("mycommand".to_string(), String::new()))
+        );
     }
 
     #[test]
-    fn is_extension_command_expanded_returns_false() {
-        // If the resource loader expanded it, the expanded text differs from the original.
-        assert!(!is_extension_command(
-            "/prompt-name",
-            "This is the expanded prompt text."
-        ));
+    fn parse_extension_command_line_preserves_arguments() {
+        assert_eq!(
+            parse_extension_command_line("/mycommand alpha beta"),
+            Some(("mycommand".to_string(), "alpha beta".to_string()))
+        );
     }
 
     #[test]
-    fn is_extension_command_no_slash() {
-        assert!(!is_extension_command("hello", "hello"));
+    fn parse_extension_command_line_requires_leading_slash() {
+        assert_eq!(parse_extension_command_line("hello"), None);
     }
 
     #[test]
-    fn is_extension_command_leading_whitespace() {
-        assert!(is_extension_command("  /cmd", "  /cmd"));
+    fn parse_extension_command_line_accepts_leading_whitespace() {
+        assert_eq!(
+            parse_extension_command_line("  /cmd\targ"),
+            Some(("cmd".to_string(), "arg".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_extension_command_line_rejects_blank_command_name() {
+        assert_eq!(parse_extension_command_line("/   "), None);
     }
 
     #[test]
@@ -5604,6 +5659,131 @@ export default function init(pi) {
             .expect("queue-state content should be json");
             assert_eq!(reported_state["steeringMode"], "all");
             assert_eq!(reported_state["followUpMode"], "all");
+
+            drop(in_tx);
+            let result = server.await;
+            assert!(result.is_ok(), "rpc server error: {result:?}");
+        });
+    }
+
+    #[test]
+    fn rpc_prompt_prefers_extension_command_over_prompt_template_name_collision() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let cwd = temp.path().to_path_buf();
+            let (agent_session, options) = build_queue_state_rpc_fixture(&handle, &cwd).await;
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+            let out_rx = Arc::new(Mutex::new(out_rx));
+
+            let server =
+                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+            let prompt = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"1","type":"prompt","message":"/report-queue-state"}"#,
+                "prompt(report-queue-state:shadowed)",
+            )
+            .await;
+            assert_ok(&prompt, "prompt");
+
+            let message =
+                wait_for_custom_message(&in_tx, &out_rx, "queue-state", "queue-state shadowed")
+                    .await;
+            let reported_state: Value = serde_json::from_str(
+                message["content"]
+                    .as_str()
+                    .expect("queue-state content should be string"),
+            )
+            .expect("queue-state content should be json");
+            assert!(
+                reported_state["steeringMode"].is_string(),
+                "extension command should report steeringMode"
+            );
+            assert!(
+                reported_state["followUpMode"].is_string(),
+                "extension command should report followUpMode"
+            );
+
+            drop(in_tx);
+            let result = server.await;
+            assert!(result.is_ok(), "rpc server error: {result:?}");
+        });
+    }
+
+    #[test]
+    fn rpc_steer_rejects_extension_command_even_when_prompt_template_name_matches() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let cwd = temp.path().to_path_buf();
+            let (agent_session, options) = build_queue_state_rpc_fixture(&handle, &cwd).await;
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+            let out_rx = Arc::new(Mutex::new(out_rx));
+
+            let server =
+                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+            let response = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"1","type":"steer","message":"/report-queue-state"}"#,
+                "steer(report-queue-state:shadowed)",
+            )
+            .await;
+            assert_err(&response, "steer");
+            assert_eq!(
+                response["error"],
+                "Extension commands are not allowed with steer"
+            );
+
+            drop(in_tx);
+            let result = server.await;
+            assert!(result.is_ok(), "rpc server error: {result:?}");
+        });
+    }
+
+    #[test]
+    fn rpc_follow_up_rejects_extension_command_even_when_prompt_template_name_matches() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let cwd = temp.path().to_path_buf();
+            let (agent_session, options) = build_queue_state_rpc_fixture(&handle, &cwd).await;
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+            let out_rx = Arc::new(Mutex::new(out_rx));
+
+            let server =
+                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+            let response = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"1","type":"follow_up","message":"/report-queue-state"}"#,
+                "follow_up(report-queue-state:shadowed)",
+            )
+            .await;
+            assert_err(&response, "follow_up");
+            assert_eq!(
+                response["error"],
+                "Extension commands are not allowed with follow_up"
+            );
 
             drop(in_tx);
             let result = server.await;

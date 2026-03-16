@@ -2874,9 +2874,10 @@ fn persist_package_toggles_with_roots(
             continue;
         };
 
-        let settings_path = config_override_path
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| Config::settings_path_with_roots(scope, global_dir, cwd));
+        let settings_path = config_override_path.map_or_else(
+            || Config::settings_path_with_roots(scope, global_dir, cwd),
+            Path::to_path_buf,
+        );
         let mut settings = load_settings_json_object(&settings_path)?;
         if !settings.is_object() {
             settings = json!({});
@@ -5316,8 +5317,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn persist_package_toggles_with_config_override_updates_override_only() {
+    struct ConfigOverridePackageToggleFixture {
+        cwd: PathBuf,
+        global_dir: PathBuf,
+        override_path: PathBuf,
+        global_original: String,
+        project_original: String,
+    }
+
+    fn setup_config_override_package_toggle_fixture() -> ConfigOverridePackageToggleFixture {
         let temp = TempDir::new().expect("tempdir");
         let cwd = temp.path().join("repo");
         let global_dir = temp.path().join("global");
@@ -5357,6 +5365,53 @@ mod tests {
         )
         .expect("write override settings");
 
+        ConfigOverridePackageToggleFixture {
+            cwd,
+            global_dir,
+            override_path,
+            global_original,
+            project_original,
+        }
+    }
+
+    fn string_array_field<'a>(
+        value: &'a serde_json::Value,
+        field: &str,
+        missing_message: &str,
+    ) -> Vec<&'a str> {
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_array)
+            .expect(missing_message)
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect()
+    }
+
+    fn assert_override_package(
+        value: &serde_json::Value,
+        expected_source: &str,
+        field: &str,
+        expected_paths: &[&str],
+    ) {
+        assert_eq!(
+            value
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .expect("source"),
+            expected_source
+        );
+        assert_eq!(
+            string_array_field(value, field, field),
+            expected_paths,
+            "{field} mismatch for {expected_source}"
+        );
+    }
+
+    #[test]
+    fn persist_package_toggles_with_config_override_updates_override_only() {
+        let fixture = setup_config_override_package_toggle_fixture();
+
         let packages = vec![
             ConfigPackageState {
                 scope: SettingsScope::Global,
@@ -5387,66 +5442,44 @@ mod tests {
             },
         ];
 
-        persist_package_toggles_with_roots(&cwd, &global_dir, Some(&override_path), &packages)
-            .expect("persist package toggles");
+        persist_package_toggles_with_roots(
+            &fixture.cwd,
+            &fixture.global_dir,
+            Some(&fixture.override_path),
+            &packages,
+        )
+        .expect("persist package toggles");
 
-        let override_value: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&override_path).expect("read override"))
-                .expect("parse override json");
+        let override_value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&fixture.override_path).expect("read override"),
+        )
+        .expect("parse override json");
         let override_packages = override_value["packages"]
             .as_array()
             .expect("override packages array");
         assert_eq!(override_packages.len(), 2);
 
-        let override_pkg = override_packages[0]
-            .as_object()
-            .expect("override package object");
-        assert_eq!(
-            override_pkg
-                .get("source")
-                .and_then(serde_json::Value::as_str)
-                .expect("source"),
-            "npm:override"
+        assert_override_package(
+            &override_packages[0],
+            "npm:override",
+            "extensions",
+            &["extensions/new.js"],
         );
-        assert_eq!(
-            override_pkg
-                .get("extensions")
-                .and_then(serde_json::Value::as_array)
-                .expect("extensions")
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .collect::<Vec<_>>(),
-            vec!["extensions/new.js"]
-        );
-
-        let override_project_pkg = override_packages[1]
-            .as_object()
-            .expect("override project package object");
-        assert_eq!(
-            override_project_pkg
-                .get("source")
-                .and_then(serde_json::Value::as_str)
-                .expect("source"),
-            "npm:override-project"
-        );
-        assert_eq!(
-            override_project_pkg
-                .get("skills")
-                .and_then(serde_json::Value::as_array)
-                .expect("skills")
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .collect::<Vec<_>>(),
-            vec!["skills/demo/SKILL.md"]
+        assert_override_package(
+            &override_packages[1],
+            "npm:override-project",
+            "skills",
+            &["skills/demo/SKILL.md"],
         );
 
         assert_eq!(
-            std::fs::read_to_string(global_dir.join("settings.json")).expect("read global"),
-            global_original
+            std::fs::read_to_string(fixture.global_dir.join("settings.json")).expect("read global"),
+            fixture.global_original
         );
         assert_eq!(
-            std::fs::read_to_string(cwd.join(".pi").join("settings.json")).expect("read project"),
-            project_original
+            std::fs::read_to_string(fixture.cwd.join(".pi").join("settings.json"))
+                .expect("read project"),
+            fixture.project_original
         );
     }
 
