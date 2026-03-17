@@ -73,6 +73,10 @@ async fn recv_line(rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Result<Str
     }
 }
 
+fn rpc_output_channel() -> (std::sync::mpsc::SyncSender<String>, Receiver<String>) {
+    std::sync::mpsc::sync_channel::<String>(1024)
+}
+
 #[test]
 fn rpc_rejects_invalid_json_and_missing_type() {
     let harness = TestHarness::new("rpc_rejects_invalid_json_and_missing_type");
@@ -96,7 +100,7 @@ fn rpc_rejects_invalid_json_and_missing_type() {
         };
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -167,7 +171,7 @@ fn rpc_errors_on_unknown_command_and_missing_params() {
         };
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -288,7 +292,7 @@ fn rpc_get_messages_preserves_tool_call_identity_and_args() {
         };
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = rpc_output_channel();
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });

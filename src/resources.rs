@@ -1553,7 +1553,9 @@ pub fn parse_command_args(args: &str) -> Vec<String> {
             continue;
         }
 
-        if ch == '"' || ch == '\'' {
+        // Treat quotes as delimiters only at the start of a token so embedded
+        // apostrophes in natural-language input stay literal.
+        if (ch == '"' || ch == '\'') && current.is_empty() {
             in_quote = Some(ch);
         } else if ch.is_whitespace() {
             if !current.is_empty() || just_closed_quote {
@@ -3006,6 +3008,15 @@ still frontmatter",
         );
     }
 
+    #[test]
+    fn test_parse_command_args_preserves_apostrophes_inside_words() {
+        assert_eq!(parse_command_args("it's fine"), vec!["it's", "fine"]);
+        assert_eq!(
+            parse_command_args("review o'brien's draft"),
+            vec!["review", "o'brien's", "draft"]
+        );
+    }
+
     // ── substitute_args edge cases ─────────────────────────────────────
 
     #[test]
@@ -3094,6 +3105,20 @@ still frontmatter",
 
         let result = expand_prompt_template("/review foo \"\" \"\" bar", &[template]);
         assert_eq!(result, "first=[foo] second=[] third=[] fourth=[bar]");
+    }
+
+    #[test]
+    fn test_expand_prompt_template_preserves_apostrophes_in_arguments() {
+        let template = PromptTemplate {
+            name: "review".to_string(),
+            description: "review prompt".to_string(),
+            content: "first=[$1] second=[$2]".to_string(),
+            source: "test".to_string(),
+            file_path: PathBuf::from("/review.md"),
+        };
+
+        let result = expand_prompt_template("/review it's fine", &[template]);
+        assert_eq!(result, "first=[it's] second=[fine]");
     }
 
     // ── parse_frontmatter edge cases ───────────────────────────────────
