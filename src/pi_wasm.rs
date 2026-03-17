@@ -183,7 +183,7 @@ fn extract_bytes(ctx: &Ctx<'_>, value: &Value<'_>) -> rquickjs::Result<Vec<u8>> 
     }
     // Try array of numbers
     if let Some(arr) = value.as_array() {
-        let mut bytes = Vec::with_capacity(arr.len());
+        let mut bytes = Vec::with_capacity(arr.len().min(1024 * 1024));
         for i in 0..arr.len() {
             let v: i32 = arr.get(i)?;
             bytes.push(
